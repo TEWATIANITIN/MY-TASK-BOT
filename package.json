@@ -1,0 +1,27 @@
+{
+  "name": "whatsapp-task-followup-bot",
+  "version": "1.0.0",
+  "description": "Automated WhatsApp task follow-up bot for employee delegation in 1-on-1 and group chats",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "node test/testParser.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.2",
+    "node-cron": "^3.0.3",
+    "sqlite3": "^5.1.7",
+    "@whiskeysockets/baileys": "^6.7.8",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "keywords": ["whatsapp", "bot", "task-management", "follow-up", "reminders", "meta-cloud-api"],
+  "author": "Task Tracker Team",
+  "license": "MIT"
+}

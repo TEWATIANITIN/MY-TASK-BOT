@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  whatsapp-task-bot:
+    build: .
+    container_name: whatsapp-task-bot
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - WHATSAPP_TOKEN=${WHATSAPP_TOKEN}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN}
+      - TIMEZONE=Asia/Kolkata
+    volumes:
+      - ./data:/app/data
+      - ./auth_info_baileys:/app/auth_info_baileys
