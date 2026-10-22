@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
-whatsappCloud.initBaileys();
+whatsappCloud.connectToWhatsApp();
 
 // 1. Meta WhatsApp Webhook endpoints
 app.get('/webhook', (req, res) => whatsappCloud.verifyWebhook(req, res));
