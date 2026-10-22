@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 const taskService = require('./taskService');
-const whatsappCloud = require('./whatsappCloud');
+const whatsappCloud = require('./whatsappBaileys');
 const TaskUpdateParser = require('./nlpParser');
 
 const app = express();
@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+whatsappCloud.initBaileys();
 
 // 1. Meta WhatsApp Webhook endpoints
 app.get('/webhook', (req, res) => whatsappCloud.verifyWebhook(req, res));
