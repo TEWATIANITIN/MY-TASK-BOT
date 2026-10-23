@@ -1,13 +1,13 @@
 /**
- * WhatsTask Auto-Followup Bot (Upgraded v2.0)
+ * WhatsTask Auto-Followup Bot (Upgraded v2.3 - Complete Final Code)
  * Features:
- * 1. Night Quiet Hours (6:00 PM to 9:00 AM IST - No night disturbance)
- * 2. Multiple Tasks in a single message (1. Task A, 2. Task B, 3. Task C)
- * 3. Smart % Progress & Delay tracking (20%, 25%, "thoda delay hai")
- * 4. Boss/Manager Approval ("Close #101" / "Approve #101" or Dashboard button) - Employee can't prematurely stop reminders
- * 5. Loop Protection (Bot never replies to its own messages)
- * 6. 15m, 1h, 2h, 4h, and 24h (Daily same time) reminder options
- * 7. Auto-Reconnect & Self-Keep-Alive to prevent 6:00 AM disconnects
+ * 1. Fixes "Waiting for this message" via getMessage retry store & 2s queue
+ * 2. Fixes Employee Reply matching (#103 15% ho gaya) across @lid and @s.whatsapp.net
+ * 3. Smart Q&A / Any Reply handling: Records any question/answer/reply & asks for % progress
+ * 4. Night Quiet Hours (6:00 PM to 9:00 AM IST - No night disturbance)
+ * 5. Multiple Tasks in a single message (1. Task A, 2. Task B, 3. Task C)
+ * 6. Boss/Manager Approval ("Approve #101" / "Close #101" or Dashboard button)
+ * 7. Auto-Live QR Refresh + 8-Digit Phone Pairing Code + 1-Click Session Reset
  */
 
 const express = require('express');
@@ -15,11 +15,13 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const pino = require('pino');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  Browsers
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -28,8 +30,8 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- Persistent File Store (Saves tasks & settings locally) ---
 const DATA_FILE = path.join(__dirname, 'tasks_data.json');
+const AUTH_FOLDER = path.join(__dirname, 'auth_info_baileys');
 
 let store = {
   nextId: 101,
@@ -66,66 +68,87 @@ function saveStore() {
 
 loadStore();
 
-// --- Helper: Get Current Hour in IST (Asia/Kolkata) ---
 function getISTDate() {
   const now = new Date();
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
-  return new Date(utcMs + 5.5 * 3600000); // UTC + 5:30
+  return new Date(utcMs + 5.5 * 3600000);
 }
 
 function isQuietHours() {
   if (!store.settings.quietHoursEnabled) return false;
   const ist = getISTDate();
   const hour = ist.getHours();
-  const start = store.settings.quietStartHour; // 18 (6 PM)
-  const end = store.settings.quietEndHour;     // 9 (9 AM)
-
+  const start = store.settings.quietStartHour;
+  const end = store.settings.quietEndHour;
   if (start > end) {
-    // Overnight window e.g. 18:00 to 09:00
     return hour >= start || hour < end;
-  } else {
-    return hour >= start && hour < end;
   }
+  return hour >= start && hour < end;
 }
 
-// --- WhatsApp Connection State ---
 let sock = null;
 let currentQR = null;
+let currentPairingCode = null;
 let isConnected = false;
+let isConnecting = false;
+let reconnectTimer = null;
 let botOwnJid = null;
-const sentByBotMessageIds = new Set(); // Prevents infinite loops 100%
 
-async function sendWhatsAppMessage(jid, text) {
-  if (!sock || !isConnected) {
-    console.log(`[Offline Queue -> ${jid}]: ${text}`);
-    return null;
-  }
+const sentByBotMessageIds = new Set();
+const sentMessagesForRetry = new Map();
+let sendQueuePromise = Promise.resolve();
+
+function clearAuthFolder() {
   try {
-    const sent = await sock.sendMessage(jid, { text });
-    if (sent && sent.key && sent.key.id) {
-      sentByBotMessageIds.add(sent.key.id);
-      // Keep set bounded
-      if (sentByBotMessageIds.size > 500) {
-        const first = sentByBotMessageIds.values().next().value;
-        sentByBotMessageIds.delete(first);
-      }
+    if (fs.existsSync(AUTH_FOLDER)) {
+      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+      console.log('🧹 Cleared auth_info_baileys folder for fresh session.');
     }
-    return sent;
-  } catch (err) {
-    console.error('Failed to send WhatsApp message:', err.message);
-    return null;
+  } catch (e) {
+    console.error('Failed to clear auth folder:', e.message);
   }
 }
 
-// --- Clean WhatsApp internal @LID / @JID numbers in task text ---
+function sendWhatsAppMessage(jid, text) {
+  sendQueuePromise = sendQueuePromise.then(async () => {
+    if (!sock || !isConnected) {
+      console.log(`[Offline Queue -> ${jid}]: ${text}`);
+      return null;
+    }
+    try {
+      const sent = await sock.sendMessage(jid, { text });
+      if (sent && sent.key && sent.key.id) {
+        const id = sent.key.id;
+        sentByBotMessageIds.add(id);
+        sentMessagesForRetry.set(id, sent.message || { conversation: text });
+
+        if (sentByBotMessageIds.size > 500) {
+          const first = sentByBotMessageIds.values().next().value;
+          sentByBotMessageIds.delete(first);
+        }
+        if (sentMessagesForRetry.size > 500) {
+          const firstKey = sentMessagesForRetry.keys().next().value;
+          sentMessagesForRetry.delete(firstKey);
+        }
+      }
+      await new Promise(r => setTimeout(r, 2000));
+      return sent;
+    } catch (err) {
+      console.error('Failed to send WhatsApp message:', err.message);
+      await new Promise(r => setTimeout(r, 1000));
+      return null;
+    }
+  });
+  return sendQueuePromise;
+}
+
 function cleanTaskText(rawText) {
   return rawText
-    .replace(/^task\s*:\s*/i, '')
-    .replace(/\[(\d+(?:m|h|hr|hrs|d))\]/gi, '')
+    .replace(/^(?:task|टास्क)\s*:\s*/i, '')
+    .replace(/\[(\d+\s*(?:m|min|mins|h|hr|hrs|d|day))\]/gi, '')
     .trim();
 }
 
-// --- Parse Interval Tag from Message (e.g. [15m], [1h], [2h], [4h], [24h]) ---
 function parseIntervalMinutes(rawText, defaultMins = 120) {
   const m = rawText.match(/\[(\d+)\s*(m|min|mins|h|hr|hrs|d|day)\]/i);
   if (!m) return defaultMins;
@@ -137,18 +160,18 @@ function parseIntervalMinutes(rawText, defaultMins = 120) {
   return defaultMins;
 }
 
-// --- Split Multi-Task Message into Individual Tasks ---
 function extractMultipleTasks(rawBody) {
-  const bodyAfterPrefix = rawBody.replace(/^task\s*:\s*/i, '').trim();
+  const bodyAfterPrefix = rawBody
+    .replace(/^(?:task|टास्क)\s*:\s*/i, '')
+    .replace(/\[(\d+\s*(?:m|min|mins|h|hr|hrs|d|day))\]/gi, '')
+    .trim();
 
-  // Check if message has multiple lines or numbered list (1. ..., 2. ..., 3. ...)
   const lines = bodyAfterPrefix
     .split(/\n+/)
     .map(l => l.trim())
     .filter(Boolean);
 
   if (lines.length > 1) {
-    // If first line is just an @mention or name (e.g. "@Rahul"), attach it to sub-lines
     let assigneeHeader = '';
     let taskLines = lines;
     if (lines[0].split(/\s+/).length <= 3 && !/^\d+[\.\)]/.test(lines[0])) {
@@ -161,7 +184,6 @@ function extractMultipleTasks(rawBody) {
     }).filter(Boolean);
   }
 
-  // Also check inline numbered tasks: "1. send quote 2. call vendor 3. update sheet"
   if (/\b1[\.\)]\s+.+\b2[\.\)]\s+/i.test(bodyAfterPrefix)) {
     const parts = bodyAfterPrefix.split(/\s*(?=\b\d+[\.\)]\s+)/).map(p => p.trim()).filter(Boolean);
     let prefix = '';
@@ -179,8 +201,7 @@ function extractMultipleTasks(rawBody) {
   return [cleanTaskText(rawBody)];
 }
 
-// --- Smart Update & Reply Parser ---
-function parseIncomingReply(text, activeTasksInChat) {
+function parseIncomingReply(text, candidateTasks, isDirectChat) {
   const raw = (text || '').trim();
   const lower = raw.toLowerCase();
 
@@ -194,18 +215,22 @@ function parseIncomingReply(text, activeTasksInChat) {
     raw.startsWith('🔔') ||
     raw.startsWith('⚠️') ||
     raw.startsWith('🚨') ||
+    raw.startsWith('📝') ||
     lower.includes('update recorded') ||
     lower.includes('new task assigned') ||
+    lower.includes('multiple tasks assigned') ||
     lower.includes('task completed') ||
     lower.includes('next check-in') ||
     lower.includes('auto-reminder:') ||
-    lower.includes('approval needed')
+    lower.includes('approval needed') ||
+    lower.includes('pending boss approval') ||
+    lower.includes('delay / status noted') ||
+    lower.includes('note recorded')
   ) {
     return { ignore: true };
   }
 
-  // 2. Check if Boss/Manager is Approving / Closing a task:
-  // Examples: "Approve #101", "Close #101", "Final done #101", "Approve all"
+  // 2. Boss/Manager Approval ("Approve #101", "Close #101", "Approve all")
   const approveMatch = lower.match(/^(?:approve|close|final\s*done|ok\s*done|band\s*karo)\s*(?:#|task\s*)?(\d+|all)?/i);
   if (approveMatch) {
     return {
@@ -215,21 +240,21 @@ function parseIncomingReply(text, activeTasksInChat) {
     };
   }
 
-  // 3. Extract explicit Task ID if mentioned (e.g. "#102 40%", "102 50% ho gaya")
+  // 3. Extract explicit Task ID if mentioned (e.g. "#103 15% ho gaya hai", "102 50% ho gaya")
   let targetTaskId = null;
-  const idMatch = lower.match(/(?:#|task\s*)(\d{3,4})\b/i) || lower.match(/^(\d{3,4})\s*[:\-]/);
+  let hasExplicitId = false;
+  const idMatch = lower.match(/(?:#|task\s*)(\d{3,4})\b/i) || lower.match(/^(\d{3,4})\s*[:\-\s]/);
   if (idMatch) {
     targetTaskId = parseInt(idMatch[1], 10);
-  } else if (activeTasksInChat.length === 1) {
-    targetTaskId = activeTasksInChat[0].id;
-  } else if (activeTasksInChat.length > 1) {
-    // Default to most recently nudged or latest task in this chat
-    targetTaskId = activeTasksInChat[activeTasksInChat.length - 1].id;
+    hasExplicitId = true;
+  } else if (candidateTasks.length === 1) {
+    targetTaskId = candidateTasks[0].id;
+  } else if (candidateTasks.length > 1) {
+    targetTaskId = candidateTasks[candidateTasks.length - 1].id;
   }
 
-  // 4. Check Percentage FIRST (e.g. "20%", "25 percent ho gaya", "30% काम हो गया")
-  // Removes any "#101" first so task ID isn't confused with percentage
-  const textWithoutTaskId = lower.replace(/(?:#|task\s*)\d+/gi, '');
+  // 4. Check Percentage FIRST (e.g. "15%", "20%", "25 percent ho gaya", "30% काम हो गया")
+  const textWithoutTaskId = lower.replace(/(?:#|task\s*)\d+/gi, '').replace(/^\d{3,4}\s+/, '');
   const pctMatch = textWithoutTaskId.match(/(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
   if (pctMatch) {
     const pct = Math.min(100, Math.max(0, parseInt(pctMatch[1], 10)));
@@ -252,8 +277,8 @@ function parseIncomingReply(text, activeTasksInChat) {
     }
   }
 
-  // 5. Check Delay / Blocker / Partial keywords ("thoda delay hai", "kal hoga", "aadha hua", "abhi nahi hua")
-  if (/\b(delay|late|time lagega|kal|parson|ruk|atka|blocked|stuck|wait|baaki|baki|nahi hua|nhi hua|chalu hai|chal raha)\b|डिले|देरी|कल|बाकी|नहीं हुआ|चल रहा/i.test(lower)) {
+  // 5. Check Delay / Blocker / Partial keywords
+  if (/\b(delay|late|time lagega|kal|parson|ruk|atka|blocked|stuck|wait|baaki|baki|nahi hua|nhi hua|chalu hai|chal raha|kar raha|kr raha|working)\b|डिले|देरी|कल|बाकी|नहीं हुआ|चल रहा|कर रहा/i.test(lower)) {
     return {
       ignore: false,
       type: 'delay_or_note',
@@ -282,8 +307,8 @@ function parseIncomingReply(text, activeTasksInChat) {
     };
   }
 
-  // 6. Check if Employee claims "Done" / "ho gaya" (without any <100% number)
-  if (/\b(done|completed|complete|ho gaya|hogaya|ho gya|khatam|poora ho gaya)\b|हो गया|पूरा हो गया|खत्म/i.test(lower)) {
+  // 6. Check if Employee claims "Done" / "ho gaya"
+  if (/\b(done|completed|complete|ho gaya|hogaya|ho gya|khatam|poora ho gaya|bhej diya|kar diya)\b|हो गया|पूरा हो गया|खत्म|भेज दिया|कर दिया/i.test(lower)) {
     return {
       ignore: false,
       type: 'employee_claim_done',
@@ -293,29 +318,69 @@ function parseIncomingReply(text, activeTasksInChat) {
     };
   }
 
+  // 7. General Q&A or any reply on a task (if employee tagged #103 OR replied in 1-on-1 chat with active task)
+  if ((hasExplicitId || (isDirectChat && candidateTasks.length > 0)) && raw.length >= 2) {
+    return {
+      ignore: false,
+      type: 'general_qa_note',
+      targetId: targetTaskId,
+      note: raw
+    };
+  }
+
   return { ignore: true };
 }
 
-// --- Format Interval Label ---
 function formatIntervalLabel(mins) {
   if (mins >= 1440 && mins % 1440 === 0) return `Every ${mins / 1440} Day(s) (24 Hours)`;
   if (mins >= 60 && mins % 60 === 0) return `Every ${mins / 60} Hour(s)`;
   return `Every ${mins} Mins`;
 }
 
-// --- Start Baileys WhatsApp Connection with Auto-Reconnect ---
 async function startWhatsApp() {
+  if (isConnecting) return;
+  isConnecting = true;
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   try {
-    const authFolder = path.join(__dirname, 'auth_info_baileys');
-    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
-    const { version } = await fetchLatestBaileysVersion();
+    if (sock) {
+      try {
+        sock.ev.removeAllListeners('connection.update');
+        sock.ev.removeAllListeners('creds.update');
+        sock.ev.removeAllListeners('messages.upsert');
+        sock.ws?.close();
+      } catch (e) {}
+      sock = null;
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    let version = [2, 3000, 1015901307];
+    try {
+      const latest = await fetchLatestBaileysVersion();
+      if (latest && latest.version) version = latest.version;
+    } catch (e) {}
 
     sock = makeWASocket({
       version,
       auth: state,
+      logger: pino({ level: 'silent' }),
       printQRInTerminal: true,
-      browser: ['WhatsTask Bot', 'Chrome', '1.0.0'],
-      syncFullHistory: false
+      browser: Browsers && Browsers.ubuntu ? Browsers.ubuntu('Chrome') : ['Ubuntu', 'Chrome', '20.0.04'],
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      getMessage: async (key) => {
+        if (key && key.id && sentMessagesForRetry.has(key.id)) {
+          return sentMessagesForRetry.get(key.id);
+        }
+        return { conversation: '⏰ Task Reminder Check-in' };
+      }
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -326,32 +391,36 @@ async function startWhatsApp() {
       if (qr) {
         currentQR = qr;
         isConnected = false;
-        console.log('📲 New QR Code generated. Scan from dashboard.');
+        console.log('📲 New QR Code generated.');
       }
 
       if (connection === 'open') {
         currentQR = null;
+        currentPairingCode = null;
         isConnected = true;
+        isConnecting = false;
         botOwnJid = sock.user?.id;
         console.log('✅ WhatsApp Connected as:', botOwnJid);
       }
 
       if (connection === 'close') {
         isConnected = false;
+        isConnecting = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
+        console.log(`⚠️ Connection closed (code: ${statusCode}).`);
 
-        console.log(`⚠️ Connection closed (code: ${statusCode}). LoggedOut: ${loggedOut}`);
-
-        if (loggedOut) {
-          // Only delete auth folder if user explicitly clicked "Log out" from phone
-          try {
-            fs.rmSync(authFolder, { recursive: true, force: true });
-          } catch (e) {}
-          setTimeout(startWhatsApp, 3000);
+        if (
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === DisconnectReason.badSession ||
+          statusCode === 401 ||
+          statusCode === 403
+        ) {
+          clearAuthFolder();
+          currentQR = null;
+          currentPairingCode = null;
+          reconnectTimer = setTimeout(startWhatsApp, 2500);
         } else {
-          // Transient network drop at 6:00 AM -> Reconnect automatically WITHOUT wiping session!
-          setTimeout(startWhatsApp, 4000);
+          reconnectTimer = setTimeout(startWhatsApp, 4000);
         }
       }
     });
@@ -363,11 +432,12 @@ async function startWhatsApp() {
         if (!msg.message) continue;
 
         const msgId = msg.key.id;
-        // Skip if this exact message was sent by our bot!
         if (sentByBotMessageIds.has(msgId)) continue;
 
         const remoteJid = msg.key.remoteJid;
         if (!remoteJid || remoteJid === 'status@broadcast') continue;
+
+        const senderPn = msg.key.senderPn || msg.key.participant || null;
 
         const text =
           msg.message.conversation ||
@@ -377,23 +447,27 @@ async function startWhatsApp() {
         if (!text || !text.trim()) continue;
         const trimmed = text.trim();
 
-        // A. Check if creating new task(s): starts with "Task:" or "टास्क:"
+        // A. Assign new task(s) from WhatsApp: starts with "Task:" or "टास्क:"
         if (/^(?:task|टास्क)\s*:/i.test(trimmed)) {
-          const intervalMins = parseIntervalMinutes(trimmed, 120); // Default 2 hours
+          const intervalMins = parseIntervalMinutes(trimmed, 120);
           const subTaskStrings = extractMultipleTasks(trimmed);
 
           const createdTasks = [];
+          let staggerIdx = 0;
           for (const taskTitle of subTaskStrings) {
+            const staggerMs = staggerIdx * 10000;
+            staggerIdx++;
             const newTask = {
               id: store.nextId++,
               chatId: remoteJid,
+              altChatId: senderPn,
               title: taskTitle,
               assignee: 'Team',
               progress: 0,
-              status: 'in_progress', // 'in_progress' | 'pending_approval' | 'completed'
+              status: 'in_progress',
               intervalMins,
               lastNudgeAt: Date.now(),
-              nextNudgeAt: Date.now() + intervalMins * 60000,
+              nextNudgeAt: Date.now() + intervalMins * 60000 + staggerMs,
               lastNote: 'Assigned',
               createdAt: new Date().toISOString()
             };
@@ -410,7 +484,7 @@ async function startWhatsApp() {
             );
           } else {
             const listStr = createdTasks
-              .map(t => `🔹 *#${t.id}:* ${t.title} (0%)`)
+              .map(t => `🔹 *#${t.id}:* ${t.title} (0 पूरा हुआ)`)
               .join('\n');
             await sendWhatsAppMessage(
               remoteJid,
@@ -420,47 +494,60 @@ async function startWhatsApp() {
           continue;
         }
 
-        // B. Check if there are active tasks in this chat
-        const activeInChat = store.tasks.filter(
-          t => t.chatId === remoteJid && t.status !== 'completed'
-        );
-        if (activeInChat.length === 0) continue;
+        // B. Match active tasks
+        const allActiveTasks = store.tasks.filter(t => t.status !== 'completed');
+        if (allActiveTasks.length === 0) continue;
 
-        const parsed = parseIncomingReply(trimmed, activeInChat);
+        const chatMatchedTasks = allActiveTasks.filter(
+          t =>
+            t.chatId === remoteJid ||
+            t.altChatId === remoteJid ||
+            (senderPn && (t.chatId === senderPn || t.altChatId === senderPn))
+        );
+
+        const isDirectChat = !remoteJid.endsWith('@g.us');
+        const parsed = parseIncomingReply(
+          trimmed,
+          chatMatchedTasks.length > 0 ? chatMatchedTasks : allActiveTasks,
+          isDirectChat
+        );
         if (parsed.ignore) continue;
 
-        // Handle Boss Approval ("Approve #101" / "Close #101")
+        // Handle Boss Approval
         if (parsed.type === 'manager_approve') {
           if (parsed.targetId === 'all') {
-            activeInChat.forEach(t => {
+            const toClose = chatMatchedTasks.length > 0 ? chatMatchedTasks : allActiveTasks;
+            toClose.forEach(t => {
               t.status = 'completed';
               t.progress = 100;
             });
             saveStore();
             await sendWhatsAppMessage(
               remoteJid,
-              `✅ *ALL TASKS APPROVED & CLOSED*\n\nइस चैट के सभी ${activeInChat.length} टास्क बॉस द्वारा 100% Complete मार्क कर दिए गए हैं। ऑटोमैटिक रिमाइंडर बंद हो गए हैं।`
+              `✅ *ALL TASKS APPROVED & CLOSED*\n\nसभी ${toClose.length} टास्क बॉस द्वारा Complete मार्क कर दिए गए हैं। ऑटोमैटिक रिमाइंडर बंद हो गए हैं।`
             );
           } else {
-            const task = store.tasks.find(t => t.id === parsed.targetId && t.chatId === remoteJid);
+            const task = allActiveTasks.find(t => t.id === parsed.targetId);
             if (task) {
               task.status = 'completed';
               task.progress = 100;
               saveStore();
               await sendWhatsAppMessage(
                 remoteJid,
-                `✅ *TASK COMPLETED & APPROVED (#${task.id})*\n\n📌 "${task.title}" को 100% Complete कर दिया गया है। अब इसके रिमाइंडर बंद हो गए हैं।`
+                `✅ *TASK COMPLETED & APPROVED (#${task.id})*\n\n📌 "${task.title}" को Complete कर दिया गया है। अब इसके रिमाइंडर बंद हो गए हैं।`
               );
             }
           }
           continue;
         }
 
-        // Find target task for progress / delay / claim done
-        const task = store.tasks.find(
-          t => t.id === parsed.targetId && t.chatId === remoteJid && t.status !== 'completed'
-        );
+        const task = allActiveTasks.find(t => t.id === parsed.targetId);
         if (!task) continue;
+
+        if (isDirectChat && task.chatId !== remoteJid) {
+          task.altChatId = task.chatId;
+          task.chatId = remoteJid;
+        }
 
         if (parsed.type === 'progress_update') {
           task.progress = parsed.progress;
@@ -480,7 +567,15 @@ async function startWhatsApp() {
 
           await sendWhatsAppMessage(
             remoteJid,
-            `⚠️ *DELAY / STATUS NOTED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📝 *Update:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} points\n⏰ _रिमाइंडर चालू रहेगा। अगला चेक-इन तय समय पर आएगा।_`
+            `⚠️ *DELAY / STATUS NOTED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📝 *Update:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n⏰ _रिमाइंडर चालू रहेगा। कृपया साथ में काम का प्रतिशत भी बताएं।_`
+          );
+        } else if (parsed.type === 'general_qa_note') {
+          task.lastNote = parsed.note;
+          saveStore();
+
+          await sendWhatsAppMessage(
+            remoteJid,
+            `📝 *NOTE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n💬 *Reply:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n\n👉 _कृपया यह भी बताएं कि काम कितने प्रतिशत हुआ है (जैसे: "#${task.id} 25 percent ho gaya")।_`
           );
         } else if (parsed.type === 'employee_claim_done') {
           task.progress = 100;
@@ -508,16 +603,14 @@ async function startWhatsApp() {
     });
   } catch (err) {
     console.error('WhatsApp init error:', err.message);
-    setTimeout(startWhatsApp, 5000);
+    isConnecting = false;
+    reconnectTimer = setTimeout(startWhatsApp, 5000);
   }
 }
 
 // --- Background Reminder Scheduler (Runs every 60 seconds) ---
 setInterval(async () => {
-  // 1. Check Night Quiet Hours (6:00 PM to 9:00 AM IST)
-  if (isQuietHours()) {
-    return; // Do not disturb employees at night!
-  }
+  if (isQuietHours()) return;
 
   const now = Date.now();
   const dueTasks = store.tasks.filter(
@@ -532,12 +625,12 @@ setInterval(async () => {
     if (task.status === 'pending_approval') {
       await sendWhatsAppMessage(
         task.chatId,
-        `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम 100% रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`
+        `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम पूरा रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`
       );
     } else {
       await sendWhatsAppMessage(
         task.chatId,
-        `⏰ *TASK REMINDER (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया अपना अपडेट दें: जैसे *"#${task.id} 40% हो गया"* या *"#${task.id} थोड़ा डिले है"*`
+        `⏰ *TASK REMINDER (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया अपना अपडेट दें: जैसे *"#${task.id} 40% हो गया"* या *"#${task.id} थोड़ा डिले है"*`
       );
     }
   }
@@ -554,17 +647,75 @@ setInterval(() => {
   }
 }, 4 * 60 * 1000);
 
-// --- Web Dashboard API & HTML ---
+app.get('/api/status', (req, res) => {
+  const qrImageUrl = currentQR
+    ? `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(currentQR)}`
+    : '';
+  res.json({
+    isConnected,
+    qrImageUrl,
+    pairingCode: currentPairingCode || null
+  });
+});
+
+app.post('/api/pair-phone', async (req, res) => {
+  try {
+    const rawPhone = (req.body.pairPhone || '').replace(/\D/g, '');
+    if (!rawPhone || rawPhone.length < 10) {
+      return res.redirect('/?error=invalid_phone');
+    }
+    const phoneWithCountry = rawPhone.length === 10 ? `91${rawPhone}` : rawPhone;
+
+    if (!sock) {
+      await startWhatsApp();
+    }
+    await new Promise(r => setTimeout(r, 1500));
+
+    if (sock && typeof sock.requestPairingCode === 'function') {
+      const code = await sock.requestPairingCode(phoneWithCountry);
+      currentPairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
+      console.log(`🔑 Generated Pairing Code for ${phoneWithCountry}: ${currentPairingCode}`);
+    }
+    res.redirect('/');
+  } catch (err) {
+    console.error('Pairing code error:', err.message);
+    res.redirect('/?error=pair_failed');
+  }
+});
+
+app.post('/api/reset-session', async (req, res) => {
+  try {
+    isConnected = false;
+    isConnecting = false;
+    currentQR = null;
+    currentPairingCode = null;
+    if (sock) {
+      try {
+        sock.ws?.close();
+      } catch (e) {}
+      sock = null;
+    }
+    clearAuthFolder();
+    setTimeout(startWhatsApp, 1000);
+  } catch (e) {}
+  res.redirect('/');
+});
+
 app.post('/api/assign', async (req, res) => {
   const { employeeName, phone, details, intervalMins } = req.body;
   if (!phone || !details) return res.redirect('/');
 
   const cleanPhone = phone.replace(/\D/g, '');
-  const jid = cleanPhone.endsWith('@g.us') ? cleanPhone : `${cleanPhone}@s.whatsapp.net`;
+  const finalPhone = cleanPhone.length === 10 ? `91${cleanPhone}` : cleanPhone;
+  const jid = finalPhone.endsWith('@g.us') ? finalPhone : `${finalPhone}@s.whatsapp.net`;
   const mins = parseInt(intervalMins, 10) || 120;
 
   const subTasks = extractMultipleTasks(details);
+  let staggerIndex = 0;
   for (const title of subTasks) {
+    const staggerMs = staggerIndex * 10000;
+    staggerIndex++;
+
     const newTask = {
       id: store.nextId++,
       chatId: jid,
@@ -574,7 +725,7 @@ app.post('/api/assign', async (req, res) => {
       status: 'in_progress',
       intervalMins: mins,
       lastNudgeAt: Date.now(),
-      nextNudgeAt: Date.now() + mins * 60000,
+      nextNudgeAt: Date.now() + mins * 60000 + staggerMs,
       lastNote: 'Assigned from Dashboard',
       createdAt: new Date().toISOString()
     };
@@ -604,13 +755,6 @@ app.post('/api/complete/:id', async (req, res) => {
   res.redirect('/');
 });
 
-app.post('/api/settings', (req, res) => {
-  store.settings.quietHoursEnabled = req.body.quietHoursEnabled === 'on';
-  store.settings.requireManagerApproval = req.body.requireManagerApproval === 'on';
-  saveStore();
-  res.redirect('/');
-});
-
 app.get('/', async (req, res) => {
   const activeTasks = store.tasks.filter(t => t.status !== 'completed');
   const istNow = getISTDate();
@@ -619,54 +763,113 @@ app.get('/', async (req, res) => {
 
   let qrImageUrl = '';
   if (currentQR) {
-    qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(currentQR)}`;
+    qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(currentQR)}`;
   }
 
   res.send(`<!DOCTYPE html>
-<html lang="hi">
+<html lang="hi" translate="no">
 <head>
   <meta charset="UTF-8">
+  <meta name="google" content="notranslate">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsTask Auto-Followup Bot v2.0</title>
+  <title>WhatsTask Auto-Followup Bot v2.3</title>
   <style>
     body { background:#0b1120; color:#f8fafc; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
     .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:520px; margin:0 auto 16px; }
-    h1 { color:#25d366; margin:0 0 8px; font-size:24px; }
+    h1 { color:#25d366; margin:0 0 8px; font-size:22px; }
     .badge { display:inline-block; padding:6px 14px; border-radius:99px; font-size:13px; font-weight:600; margin-top:8px; }
     .badge-ok { background:#064e3b; color:#34d399; }
     .badge-warn { background:#451a03; color:#fbbf24; }
     input, select, textarea { width:100%; box-sizing:border-box; padding:12px; margin-bottom:12px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:#fff; font-size:14px; }
     .btn { width:100%; padding:13px; border:none; border-radius:10px; background:#16a34a; color:#fff; font-weight:700; font-size:15px; cursor:pointer; }
-    .task-row { background:#0f172a; border:1px solid #1e293b; border-radius:12px; padding:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; }
+    .btn-blue { background:#2563eb; }
+    .btn-red { background:#dc2626; padding:10px; font-size:13px; margin-top:8px; }
+    .task-row { background:#0f172a; border:1px solid #1e293b; border-radius:12px; padding:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .pair-box { background:#0f172a; border:2px dashed #38bdf8; border-radius:12px; padding:14px; margin-top:12px; font-size:26px; font-weight:800; letter-spacing:4px; color:#38bdf8; }
   </style>
 </head>
 <body>
   <div class="card" style="text-align:center;">
-    <h1>WhatsTask Auto-Followup Bot v2.0</h1>
-    <p style="color:#94a3b8; font-size:14px; margin:0;">Smart % Tracking • Multi-Task • Night DND (6 PM - 9 AM)</p>
-    <div>
+    <h1>WhatsTask Auto-Followup Bot v2.3</h1>
+    <p style="color:#94a3b8; font-size:13px; margin:0;">Smart % Tracking • Q&A Note • Multi-Task • Night DND</p>
+    <div id="statusBadgeContainer">
       ${isConnected
         ? '<span class="badge badge-ok">✅ WhatsApp Connected & Active</span>'
-        : '<span class="badge badge-warn">📱 Scan QR Code Below</span>'}
+        : '<span class="badge badge-warn">📱 Link WhatsApp Below (QR or Phone Number)</span>'}
     </div>
-    <p style="font-size:12px; color:#64748b; margin-top:8px;">IST Time: ${timeStr} | Night DND (6PM-9AM): <b>${quietNow ? '🌙 Sleeping (No Night Pings)' : '☀️ Active'}</b></p>
+    <p style="font-size:12px; color:#64748b; margin-top:8px;">IST Time: ${timeStr} | Night DND (6PM-9AM): <b>${quietNow ? '🌙 Sleeping' : '☀️ Active'}</b></p>
   </div>
 
-  ${!isConnected && qrImageUrl ? `
+  ${!isConnected ? `
   <div class="card" style="text-align:center;">
-    <h3 style="margin-top:0;">Scan QR Code with WhatsApp</h3>
-    <p style="font-size:13px; color:#94a3b8;">Open WhatsApp -> Linked Devices -> Link a Device</p>
-    <img src="${qrImageUrl}" style="border:8px solid #fff; border-radius:12px; max-width:240px;" />
-  </div>` : ''}
+    <h3 style="margin-top:0; color:#4ade80;">तरीका 1: बिना QR स्कैन किए नंबर से जोड़ें (सबसे आसान)</h3>
+    <p style="font-size:13px; color:#cbd5e1; margin-bottom:12px;">
+      बॉट वाला WhatsApp नंबर नीचे डालें और 8-अंकों का कोड पाएं:
+    </p>
+    <form method="POST" action="/api/pair-phone">
+      <input name="pairPhone" placeholder="WhatsApp Number with 91 (e.g. 919876543210)" required />
+      <button type="submit" class="btn btn-blue">🔑 Get 8-Digit Pairing Code</button>
+    </form>
+
+    ${currentPairingCode ? `
+      <div class="pair-box">${currentPairingCode}</div>
+      <p style="font-size:12px; color:#fbbf24; margin-top:8px;">
+        फोन में WhatsApp खोलें ➔ <b>Linked Devices</b> ➔ <b>Link a Device</b> ➔ नीचे <b>"Link with phone number instead"</b> पर टैप करें और ऊपर वाला कोड डालें!
+      </p>
+    ` : ''}
+
+    <hr style="border:0; border-top:1px solid #263554; margin:20px 0;" />
+
+    <h3 style="margin-top:0;">तरीका 2: Scan Live QR Code</h3>
+    <p style="font-size:12px; color:#94a3b8;">यह QR हर 5 सेकंड में अपने आप ताज़ा (Refresh) होता है:</p>
+    <div id="qrBox">
+      ${qrImageUrl
+        ? `<img id="qrImg" src="${qrImageUrl}" style="border:8px solid #fff; border-radius:12px; max-width:240px;" />`
+        : `<p style="color:#fbbf24; font-size:13px;">⏳ नया QR Code बन रहा है... कृपया 5 सेकंड रुकें।</p>`}
+    </div>
+
+    <form method="POST" action="/api/reset-session">
+      <button type="submit" class="btn btn-red">🔄 Reset Stuck Session & Generate Fresh QR</button>
+    </form>
+  </div>
+
+  <script>
+    setInterval(async () => {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        if (data.isConnected) {
+          window.location.reload();
+          return;
+        }
+        if (data.qrImageUrl) {
+          const qrBox = document.getElementById('qrBox');
+          const existingImg = document.getElementById('qrImg');
+          if (existingImg) {
+            if (existingImg.src !== data.qrImageUrl) existingImg.src = data.qrImageUrl;
+          } else if (qrBox) {
+            qrBox.innerHTML = '<img id="qrImg" src="' + data.qrImageUrl + '" style="border:8px solid #fff; border-radius:12px; max-width:240px;" />';
+          }
+        }
+      } catch (e) {}
+    }, 5000);
+  </script>
+  ` : `
+  <div class="card" style="text-align:center;">
+    <form method="POST" action="/api/reset-session" onsubmit="return confirm('क्या आप वाकई WhatsApp डिस्कनेक्ट करके नया नंबर जोड़ना चाहते हैं?');">
+      <button type="submit" class="btn btn-red" style="margin-top:0;">🔌 Disconnect / Change WhatsApp Number</button>
+    </form>
+  </div>
+  `}
 
   <div class="card" style="border-color:#14532d; background:#0c1f17;">
     <h4 style="color:#4ade80; margin:0 0 8px;">💡 WhatsApp से एक या कई टास्क कैसे दें?</h4>
-    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">चैट या ग्रुप में ऐसे लिखें (समय के लिए [1h], [2h], [4h], या [24h] लगाएं):</p>
+    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">चैट या ग्रुप में ऐसे लिखें (समय के लिए [15m], [1h], [2h], [4h], या [24h] लगाएं):</p>
     <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">Task: @Rahul [2h]
 1. क्लाइंट को कोटेशन भेजो
 2. साइट की फोटो मंगवाओ</pre>
     <p style="font-size:12px; color:#94a3b8; margin:8px 0 0;">
-      • एम्प्लॉई लिखेगा: <b>"#101 25% हो गया"</b> या <b>"#102 थोड़ा डिले है"</b><br>
+      • एम्प्लॉई कुछ भी जवाब देगा (जैसे <b>"#101 25% हो गया"</b> या कोई भी सवाल/जवाब), बॉट उसे नोट करेगा।<br>
       • काम पूरा होने पर बॉस लिखेंगे: <b>"Approve #101"</b> या नीचे से Complete दबाएंगे।
     </p>
   </div>
@@ -674,9 +877,9 @@ app.get('/', async (req, res) => {
   <div class="card">
     <h3 style="margin-top:0;">Assign New Task (One or Multiple)</h3>
     <form method="POST" action="/api/assign">
-      <input name="employeeName" placeholder="Employee Name (e.g. Rahul)" required />
+      <input name="employeeName" placeholder="Employee Name (e.g. DD)" required />
       <input name="phone" placeholder="WhatsApp Number with 91 (e.g. 919876543210)" required />
-      <textarea name="details" rows="3" placeholder="1. Send quotation PDF\n2. Check site report" required></textarea>
+      <textarea name="details" rows="3" placeholder="1. Send quotation PDF&#10;2. Check site report" required></textarea>
       <select name="intervalMins">
         <option value="15">Remind every 15 Minutes (Urgent)</option>
         <option value="60">Remind every 1 Hour (Daytime 9AM-6PM)</option>
