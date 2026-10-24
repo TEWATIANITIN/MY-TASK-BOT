@@ -1,13 +1,10 @@
 /**
- * WhatsTask Auto-Followup Bot (Upgraded v2.4 - Anti-Spam & Strict Task Matching)
- * Key Fixes in v2.4:
- * 1. NEVER replies to normal group/personal messages unless the message:
- *    (a) Explicitly mentions the Task ID (e.g. "#101 25% ho gaya", "#101 delay hai", "Approve #101"), OR
- *    (b) Directly Quotes / Swipe-Replies to the Bot's Task/Reminder message, OR
- *    (c) Is a short % update (e.g. "25% ho gaya") inside the exact chat where the task was assigned.
- * 2. Never leaks tasks from one chat/group into another chat/group.
- * 3. Fixes "Waiting for this message" via getMessage retry store & 2s queue.
- * 4. Adds a red "Delete" button on the Dashboard to remove old test tasks silently.
+ * WhatsTask Auto-Followup Bot (Upgraded v2.5 - Real @Mention Tagging Fix)
+ * Key Fixes in v2.5:
+ * 1. Passes `mentions` array in sock.sendMessage so @30838083317796 renders as real clickable @Name tag in WhatsApp!
+ * 2. Tags the assigned person on every automatic reminder as well.
+ * 3. Strict #Task Matching & Anti-Spam (never interrupts normal group/personal chats).
+ * 4. Fixes "Waiting for this message" via getMessage retry store & 2s queue.
  */
 
 const express = require('express');
@@ -109,14 +106,34 @@ function clearAuthFolder() {
   }
 }
 
-function sendWhatsAppMessage(jid, text) {
+// --- Build Mentions Array so @30838083317796 becomes a real clickable @Name tag in WhatsApp ---
+function buildMentions(text, savedMentions = []) {
+  const mentionSet = new Set(Array.isArray(savedMentions) ? savedMentions : []);
+  const matches = (text || '').matchAll(/@(\d{10,18})\b/g);
+  for (const m of matches) {
+    const num = m[1];
+    const alreadyHas = Array.from(mentionSet).some(j => j.startsWith(num + '@'));
+    if (!alreadyHas) {
+      if (num.length >= 13) {
+        mentionSet.add(`${num}@lid`);
+      } else {
+        mentionSet.add(`${num}@s.whatsapp.net`);
+      }
+    }
+  }
+  return Array.from(mentionSet);
+}
+
+function sendWhatsAppMessage(jid, text, savedMentions = []) {
   sendQueuePromise = sendQueuePromise.then(async () => {
     if (!sock || !isConnected) {
       console.log(`[Offline Queue -> ${jid}]: ${text}`);
       return null;
     }
     try {
-      const sent = await sock.sendMessage(jid, { text });
+      const mentions = buildMentions(text, savedMentions);
+      const payload = mentions.length > 0 ? { text, mentions } : { text };
+      const sent = await sock.sendMessage(jid, payload);
       if (sent && sent.key && sent.key.id) {
         const id = sent.key.id;
         sentByBotMessageIds.add(id);
@@ -202,17 +219,13 @@ function extractMultipleTasks(rawBody) {
 }
 
 /**
- * STRICT REPLY PARSER (v2.4)
- * Never triggers on casual group/personal messages unless:
- * - User explicitly writes #TaskID (e.g. "#101 25% ho gaya"), OR
- * - User swipe-replies (quotes) a Bot message containing (#101), OR
- * - Inside a chat that has an active task, user sends a short direct % update (e.g. "25% ho gaya")
+ * STRICT REPLY PARSER (v2.5)
  */
 function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) {
   const raw = (text || '').trim();
   const lower = raw.toLowerCase();
 
-  // 1. HARD LOOP GUARD: Ignore Bot's own messages & system templates
+  // 1. HARD LOOP GUARD
   if (
     raw.startsWith('👍') ||
     raw.startsWith('📋') ||
@@ -247,7 +260,7 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     };
   }
 
-  // 3. Check if message has an EXPLICIT Task ID (#101 or Task 101) OR quotes a Bot message with (#101)
+  // 3. Check explicit Task ID (#101) OR quoted Bot message with (#101)
   let targetTaskId = null;
   let isExplicitlyTargeted = false;
 
@@ -260,7 +273,6 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     }
   }
 
-  // Check if user swipe-replied (quoted) a Bot message containing (#101)
   if (!targetTaskId && quotedText) {
     const quotedIdMatch = quotedText.match(/\(#(\d{3,4})\)/) || quotedText.match(/#(\d{3,4})\b/);
     if (quotedIdMatch) {
@@ -272,22 +284,21 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     }
   }
 
-  // 4. If NOT explicitly tagged with #ID and NOT quoting a bot message:
-  // Only allow if THIS exact chat has an active task AND the message is a short direct percentage update (<= 45 chars)
-  const textWithoutTaskId = lower.replace(/(?:#|task\s*)\d+/gi, '');
-  const pctMatch = textWithoutTaskId.match(/\b(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
+  // 4. Remove @mention numbers and #TaskID before checking for % so @308380... isn't mistaken for a number
+  const textWithoutIdsAndMentions = lower
+    .replace(/@\d{10,18}\b/g, '')
+    .replace(/(?:#|task\s*)\d+/gi, '');
+  const pctMatch = textWithoutIdsAndMentions.match(/\b(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
 
   if (!isExplicitlyTargeted) {
     if (chatMatchedTasks.length > 0 && pctMatch && raw.length <= 45) {
       targetTaskId = chatMatchedTasks[chatMatchedTasks.length - 1].id;
     } else {
-      // Normal conversation in group or personal chat -> 100% IGNORE!
       return { ignore: true };
     }
   }
 
-  // Now we are 100% sure this message is meant for `targetTaskId`!
-  // 5. Check Percentage (e.g. "#101 25% ho gaya")
+  // 5. Check Percentage
   if (pctMatch) {
     const pct = Math.min(100, Math.max(0, parseInt(pctMatch[1], 10)));
     if (pct < 100) {
@@ -309,7 +320,7 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     }
   }
 
-  // 6. Check Delay / Blocker keywords (only when #ID or swipe-reply is used)
+  // 6. Check Delay / Blocker keywords
   if (/\b(delay|late|time lagega|kal|parson|ruk|atka|blocked|stuck|wait|baaki|baki|nahi hua|nhi hua|chalu hai|chal raha|kar raha|kr raha|working)\b|डिले|देरी|कल|बाकी|नहीं हुआ|चल रहा|कर रहा/i.test(lower)) {
     return {
       ignore: false,
@@ -339,7 +350,7 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     };
   }
 
-  // 7. Check if Employee claims "Done" / "ho gaya" (only when #ID or swipe-reply is used)
+  // 7. Check if Employee claims "Done" / "ho gaya"
   if (/\b(done|completed|complete|ho gaya|hogaya|ho gya|khatam|poora ho gaya)\b|हो गया|पूरा हो गया|खत्म/i.test(lower)) {
     return {
       ignore: false,
@@ -350,7 +361,7 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     };
   }
 
-  // 8. Any other question/answer tagged with #ID or swipe-replied to the bot
+  // 8. General Q&A note when tagged with #ID or swipe-replied to bot
   return {
     ignore: false,
     type: 'general_qa_note',
@@ -475,14 +486,15 @@ async function startWhatsApp() {
         if (!text || !text.trim()) continue;
         const trimmed = text.trim();
 
-        // Extract quoted message text if the user swipe-replied to a bot message
-        const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+        const contextInfo = msg.message.extendedTextMessage?.contextInfo;
+        const mentionedJids = contextInfo?.mentionedJid || [];
+        const quotedMsg = contextInfo?.quotedMessage;
         const quotedText =
           quotedMsg?.conversation ||
           quotedMsg?.extendedTextMessage?.text ||
           '';
 
-        // A. Assign new task(s) from WhatsApp ONLY when message starts with "Task:" or "टास्क:"
+        // A. Assign new task(s) from WhatsApp when message starts with "Task:" or "टास्क:"
         if (/^(?:task|टास्क)\s*:/i.test(trimmed)) {
           const intervalMins = parseIntervalMinutes(trimmed, 120);
           const subTaskStrings = extractMultipleTasks(trimmed);
@@ -492,11 +504,13 @@ async function startWhatsApp() {
           for (const taskTitle of subTaskStrings) {
             const staggerMs = staggerIdx * 10000;
             staggerIdx++;
+            const taskMentions = buildMentions(taskTitle, mentionedJids);
             const newTask = {
               id: store.nextId++,
               chatId: remoteJid,
               altChatId: senderPn,
               title: taskTitle,
+              mentions: taskMentions,
               assignee: 'Team',
               progress: 0,
               status: 'in_progress',
@@ -515,7 +529,8 @@ async function startWhatsApp() {
             const t = createdTasks[0];
             await sendWhatsAppMessage(
               remoteJid,
-              `📋 *NEW TASK ASSIGNED (#${t.id})*\n\n📌 *Task:* ${t.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(t.intervalMins)} (9 AM - 6 PM)\n\n💡 _Update देने के लिए इस मैसेज पर Reply करें या लिखें: "#${t.id} 25% हो गया"_\n🔒 _काम पूरा होने पर बॉस "Approve #${t.id}" लिखकर बंद करेंगे।_`
+              `📋 *NEW TASK ASSIGNED (#${t.id})*\n\n📌 *Task:* ${t.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(t.intervalMins)} (9 AM - 6 PM)\n\n💡 _Update देने के लिए इस मैसेज पर Reply करें या लिखें: "#${t.id} 25% हो गया"_\n🔒 _काम पूरा होने पर बॉस "Approve #${t.id}" लिखकर बंद करेंगे।_`,
+              t.mentions
             );
           } else {
             const listStr = createdTasks
@@ -523,7 +538,8 @@ async function startWhatsApp() {
               .join('\n');
             await sendWhatsAppMessage(
               remoteJid,
-              `📋 *MULTIPLE TASKS ASSIGNED (${createdTasks.length} Tasks)*\n\n${listStr}\n\n⏰ *Auto-Reminder:* ${formatIntervalLabel(intervalMins)} (9 AM - 6 PM)\n💡 _अलग-अलग अपडेट ऐसे दें:_\n_• "#${createdTasks[0].id} 50% हो गया"_\n_• "#${createdTasks[1].id} थोड़ा डिले है"_`
+              `📋 *MULTIPLE TASKS ASSIGNED (${createdTasks.length} Tasks)*\n\n${listStr}\n\n⏰ *Auto-Reminder:* ${formatIntervalLabel(intervalMins)} (9 AM - 6 PM)\n💡 _अलग-अलग अपडेट ऐसे दें:_\n_• "#${createdTasks[0].id} 50% हो गया"_\n_• "#${createdTasks[1].id} थोड़ा डिले है"_`,
+              mentionedJids
             );
           }
           continue;
@@ -569,7 +585,8 @@ async function startWhatsApp() {
               saveStore();
               await sendWhatsAppMessage(
                 remoteJid,
-                `✅ *TASK COMPLETED & APPROVED (#${task.id})*\n\n📌 "${task.title}" को Complete कर दिया गया है। अब इसके रिमाइंडर बंद हो गए हैं।`
+                `✅ *TASK COMPLETED & APPROVED (#${task.id})*\n\n📌 "${task.title}" को Complete कर दिया गया है। अब इसके रिमाइंडर बंद हो गए हैं।`,
+                task.mentions
               );
             }
           }
@@ -594,7 +611,8 @@ async function startWhatsApp() {
 
           await sendWhatsAppMessage(
             remoteJid,
-            `📊 *TASK UPDATE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n⏰ *Next Reminder:* ${formatIntervalLabel(task.intervalMins)}`
+            `📊 *TASK UPDATE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n⏰ *Next Reminder:* ${formatIntervalLabel(task.intervalMins)}`,
+            task.mentions
           );
         } else if (parsed.type === 'delay_or_note') {
           task.lastNote = parsed.note;
@@ -603,7 +621,8 @@ async function startWhatsApp() {
 
           await sendWhatsAppMessage(
             remoteJid,
-            `⚠️ *DELAY / STATUS NOTED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📝 *Update:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n⏰ _रिमाइंडर चालू रहेगा। कृपया साथ में काम का प्रतिशत भी बताएं।_`
+            `⚠️ *DELAY / STATUS NOTED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📝 *Update:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n⏰ _रिमाइंडर चालू रहेगा। कृपया साथ में काम का प्रतिशत भी बताएं।_`,
+            task.mentions
           );
         } else if (parsed.type === 'general_qa_note') {
           task.lastNote = parsed.note;
@@ -611,7 +630,8 @@ async function startWhatsApp() {
 
           await sendWhatsAppMessage(
             remoteJid,
-            `📝 *NOTE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n💬 *Reply:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n\n👉 _कृपया यह भी बताएं कि काम कितने प्रतिशत हुआ है (जैसे: "#${task.id} 25 percent ho gaya")।_`
+            `📝 *NOTE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n💬 *Reply:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n\n👉 _कृपया यह भी बताएं कि काम कितने प्रतिशत हुआ है (जैसे: "#${task.id} 25 percent ho gaya")।_`,
+            task.mentions
           );
         } else if (parsed.type === 'employee_claim_done') {
           task.progress = 100;
@@ -624,14 +644,16 @@ async function startWhatsApp() {
 
             await sendWhatsAppMessage(
               remoteJid,
-              `🔔 *APPROVAL NEEDED (#${task.id})*\n\n📌 *Task:* ${task.title}\nएम्प्लॉई ने लिखा है कि काम पूरा हो गया है ("${parsed.note}")।\n\n👉 *बॉस ध्यान दें:* रिमाइंडर बंद करने के लिए कृपया *"Approve #${task.id}"* या *"Close #${task.id}"* लिखें (या डैशबोर्ड से Complete दबाएं)।`
+              `🔔 *APPROVAL NEEDED (#${task.id})*\n\n📌 *Task:* ${task.title}\nएम्प्लॉई ने लिखा है कि काम पूरा हो गया है ("${parsed.note}")।\n\n👉 *बॉस ध्यान दें:* रिमाइंडर बंद करने के लिए कृपया *"Approve #${task.id}"* या *"Close #${task.id}"* लिखें (या डैशबोर्ड से Complete दबाएं)।`,
+              task.mentions
             );
           } else {
             task.status = 'completed';
             saveStore();
             await sendWhatsAppMessage(
               remoteJid,
-              `✅ *TASK COMPLETED (#${task.id})*\n\n📌 "${task.title}" पूरा हो गया है। रिमाइंडर बंद कर दिए गए हैं।`
+              `✅ *TASK COMPLETED (#${task.id})*\n\n📌 "${task.title}" पूरा हो गया है। रिमाइंडर बंद कर दिए गए हैं।`,
+              task.mentions
             );
           }
         }
@@ -661,12 +683,14 @@ setInterval(async () => {
     if (task.status === 'pending_approval') {
       await sendWhatsAppMessage(
         task.chatId,
-        `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम पूरा रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`
+        `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम पूरा रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`,
+        task.mentions
       );
     } else {
       await sendWhatsAppMessage(
         task.chatId,
-        `⏰ *TASK REMINDER (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया इस मैसेज पर Reply करें या लिखें: *"#${task.id} 40% हो गया"*`
+        `⏰ *TASK REMINDER (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया इस मैसेज पर Reply करें या लिखें: *"#${task.id} 40% हो गया"*`,
+        task.mentions
       );
     }
   }
@@ -756,6 +780,7 @@ app.post('/api/assign', async (req, res) => {
       id: store.nextId++,
       chatId: jid,
       title: employeeName ? `@${employeeName} - ${title}` : title,
+      mentions: !finalPhone.endsWith('@g.us') ? [`${finalPhone}@s.whatsapp.net`] : [],
       assignee: employeeName || 'Employee',
       progress: 0,
       status: 'in_progress',
@@ -769,7 +794,8 @@ app.post('/api/assign', async (req, res) => {
 
     await sendWhatsAppMessage(
       jid,
-      `📋 *NEW TASK ASSIGNED (#${newTask.id})*\n\n👤 *Assignee:* ${newTask.assignee}\n📌 *Task:* ${newTask.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(mins)} (9 AM - 6 PM)\n\n💡 _अपडेट देने के लिए इस मैसेज पर Reply करें या लिखें: "#${newTask.id} 25% हो गया"_`
+      `📋 *NEW TASK ASSIGNED (#${newTask.id})*\n\n👤 *Assignee:* ${newTask.assignee}\n📌 *Task:* ${newTask.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(mins)} (9 AM - 6 PM)\n\n💡 _अपडेट देने के लिए इस मैसेज पर Reply करें या लिखें: "#${newTask.id} 25% हो गया"_`,
+      newTask.mentions
     );
   }
   saveStore();
@@ -785,13 +811,13 @@ app.post('/api/complete/:id', async (req, res) => {
     saveStore();
     await sendWhatsAppMessage(
       task.chatId,
-      `✅ *TASK APPROVED & COMPLETED (#${task.id})*\n\n📌 "${task.title}" को डैशबोर्ड से Complete कर दिया गया है। अब रिमाइंडर बंद हो गए हैं।`
+      `✅ *TASK APPROVED & COMPLETED (#${task.id})*\n\n📌 "${task.title}" को डैशबोर्ड से Complete कर दिया गया है। अब रिमाइंडर बंद हो गए हैं।`,
+      task.mentions
     );
   }
   res.redirect('/');
 });
 
-// Silently delete a task from dashboard without sending any WhatsApp message
 app.post('/api/delete/:id', (req, res) => {
   const id = parseInt(req.params.id, 10);
   store.tasks = store.tasks.filter(t => t.id !== id);
@@ -816,7 +842,7 @@ app.get('/', async (req, res) => {
   <meta charset="UTF-8">
   <meta name="google" content="notranslate">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsTask Auto-Followup Bot v2.4</title>
+  <title>WhatsTask Auto-Followup Bot v2.5</title>
   <style>
     body { background:#0b1120; color:#f8fafc; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
     .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:520px; margin:0 auto 16px; }
@@ -834,8 +860,8 @@ app.get('/', async (req, res) => {
 </head>
 <body>
   <div class="card" style="text-align:center;">
-    <h1>WhatsTask Auto-Followup Bot v2.4</h1>
-    <p style="color:#94a3b8; font-size:13px; margin:0;">Strict #Task Matching • Anti-Spam • Night DND (6 PM - 9 AM)</p>
+    <h1>WhatsTask Auto-Followup Bot v2.5</h1>
+    <p style="color:#94a3b8; font-size:13px; margin:0;">Real @Mention Tagging • Strict #Task Matching • Night DND</p>
     <div id="statusBadgeContainer">
       ${isConnected
         ? '<span class="badge badge-ok">✅ WhatsApp Connected & Active</span>'
@@ -908,12 +934,12 @@ app.get('/', async (req, res) => {
 
   <div class="card" style="border-color:#14532d; background:#0c1f17;">
     <h4 style="color:#4ade80; margin:0 0 8px;">💡 WhatsApp से टास्क और रिप्लाई कैसे काम करेगा?</h4>
-    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. नया टास्क देने के लिए शुरू में <b>Task:</b> लिखें:</p>
-    <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">Task: @Rahul [2h]
+    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. नया टास्क देने के लिए शुरू में <b>Task:</b> लिखें और व्यक्ति को <b>@</b> से टैग करें:</p>
+    <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">Task: @Dexterous Dessins [2h]
 1. क्लाइंट को कोटेशन भेजो
 2. साइट की फोटो मंगवाओ</pre>
     <p style="font-size:12px; color:#94a3b8; margin:8px 0 0;">
-      2. <b>अन्य चैट में कोई डिस्टर्बेंस नहीं:</b> बॉट किसी भी सामान्य चैट या ग्रुप मैसेज पर तब तक नहीं बोलेगा जब तक मैसेज में <b>#101</b> न लिखा हो या बॉट के मैसेज को <b>Swipe Reply</b> न किया गया हो।
+      2. बॉट अब उस व्यक्ति को असली हरे रंग के नाम (<b>@Name</b>) से टैग करेगा और हर रिमाइंडर पर भी उन्हें टैग करके नोटिफिकेशन भेजेगा।
     </p>
   </div>
 
