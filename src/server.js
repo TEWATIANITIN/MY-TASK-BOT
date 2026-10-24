@@ -1,13 +1,13 @@
 /**
- * WhatsTask Auto-Followup Bot (Upgraded v2.3 - Complete Final Code)
- * Features:
- * 1. Fixes "Waiting for this message" via getMessage retry store & 2s queue
- * 2. Fixes Employee Reply matching (#103 15% ho gaya) across @lid and @s.whatsapp.net
- * 3. Smart Q&A / Any Reply handling: Records any question/answer/reply & asks for % progress
- * 4. Night Quiet Hours (6:00 PM to 9:00 AM IST - No night disturbance)
- * 5. Multiple Tasks in a single message (1. Task A, 2. Task B, 3. Task C)
- * 6. Boss/Manager Approval ("Approve #101" / "Close #101" or Dashboard button)
- * 7. Auto-Live QR Refresh + 8-Digit Phone Pairing Code + 1-Click Session Reset
+ * WhatsTask Auto-Followup Bot (Upgraded v2.4 - Anti-Spam & Strict Task Matching)
+ * Key Fixes in v2.4:
+ * 1. NEVER replies to normal group/personal messages unless the message:
+ *    (a) Explicitly mentions the Task ID (e.g. "#101 25% ho gaya", "#101 delay hai", "Approve #101"), OR
+ *    (b) Directly Quotes / Swipe-Replies to the Bot's Task/Reminder message, OR
+ *    (c) Is a short % update (e.g. "25% ho gaya") inside the exact chat where the task was assigned.
+ * 2. Never leaks tasks from one chat/group into another chat/group.
+ * 3. Fixes "Waiting for this message" via getMessage retry store & 2s queue.
+ * 4. Adds a red "Delete" button on the Dashboard to remove old test tasks silently.
  */
 
 const express = require('express');
@@ -201,7 +201,14 @@ function extractMultipleTasks(rawBody) {
   return [cleanTaskText(rawBody)];
 }
 
-function parseIncomingReply(text, candidateTasks, isDirectChat) {
+/**
+ * STRICT REPLY PARSER (v2.4)
+ * Never triggers on casual group/personal messages unless:
+ * - User explicitly writes #TaskID (e.g. "#101 25% ho gaya"), OR
+ * - User swipe-replies (quotes) a Bot message containing (#101), OR
+ * - Inside a chat that has an active task, user sends a short direct % update (e.g. "25% ho gaya")
+ */
+function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) {
   const raw = (text || '').trim();
   const lower = raw.toLowerCase();
 
@@ -231,31 +238,56 @@ function parseIncomingReply(text, candidateTasks, isDirectChat) {
   }
 
   // 2. Boss/Manager Approval ("Approve #101", "Close #101", "Approve all")
-  const approveMatch = lower.match(/^(?:approve|close|final\s*done|ok\s*done|band\s*karo)\s*(?:#|task\s*)?(\d+|all)?/i);
+  const approveMatch = lower.match(/^(?:approve|close|final\s*done)\s*(?:#|task\s*)?(\d+|all)\b/i);
   if (approveMatch) {
     return {
       ignore: false,
       type: 'manager_approve',
-      targetId: approveMatch[1] && approveMatch[1] !== 'all' ? parseInt(approveMatch[1], 10) : 'all'
+      targetId: approveMatch[1] !== 'all' ? parseInt(approveMatch[1], 10) : 'all'
     };
   }
 
-  // 3. Extract explicit Task ID if mentioned (e.g. "#103 15% ho gaya hai", "102 50% ho gaya")
+  // 3. Check if message has an EXPLICIT Task ID (#101 or Task 101) OR quotes a Bot message with (#101)
   let targetTaskId = null;
-  let hasExplicitId = false;
-  const idMatch = lower.match(/(?:#|task\s*)(\d{3,4})\b/i) || lower.match(/^(\d{3,4})\s*[:\-\s]/);
-  if (idMatch) {
-    targetTaskId = parseInt(idMatch[1], 10);
-    hasExplicitId = true;
-  } else if (candidateTasks.length === 1) {
-    targetTaskId = candidateTasks[0].id;
-  } else if (candidateTasks.length > 1) {
-    targetTaskId = candidateTasks[candidateTasks.length - 1].id;
+  let isExplicitlyTargeted = false;
+
+  const explicitIdMatch = lower.match(/(?:#|task\s*)(\d{3,4})\b/i);
+  if (explicitIdMatch) {
+    const idNum = parseInt(explicitIdMatch[1], 10);
+    if (allActiveTasks.some(t => t.id === idNum)) {
+      targetTaskId = idNum;
+      isExplicitlyTargeted = true;
+    }
   }
 
-  // 4. Check Percentage FIRST (e.g. "15%", "20%", "25 percent ho gaya", "30% काम हो गया")
-  const textWithoutTaskId = lower.replace(/(?:#|task\s*)\d+/gi, '').replace(/^\d{3,4}\s+/, '');
-  const pctMatch = textWithoutTaskId.match(/(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
+  // Check if user swipe-replied (quoted) a Bot message containing (#101)
+  if (!targetTaskId && quotedText) {
+    const quotedIdMatch = quotedText.match(/\(#(\d{3,4})\)/) || quotedText.match(/#(\d{3,4})\b/);
+    if (quotedIdMatch) {
+      const qId = parseInt(quotedIdMatch[1], 10);
+      if (allActiveTasks.some(t => t.id === qId)) {
+        targetTaskId = qId;
+        isExplicitlyTargeted = true;
+      }
+    }
+  }
+
+  // 4. If NOT explicitly tagged with #ID and NOT quoting a bot message:
+  // Only allow if THIS exact chat has an active task AND the message is a short direct percentage update (<= 45 chars)
+  const textWithoutTaskId = lower.replace(/(?:#|task\s*)\d+/gi, '');
+  const pctMatch = textWithoutTaskId.match(/\b(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
+
+  if (!isExplicitlyTargeted) {
+    if (chatMatchedTasks.length > 0 && pctMatch && raw.length <= 45) {
+      targetTaskId = chatMatchedTasks[chatMatchedTasks.length - 1].id;
+    } else {
+      // Normal conversation in group or personal chat -> 100% IGNORE!
+      return { ignore: true };
+    }
+  }
+
+  // Now we are 100% sure this message is meant for `targetTaskId`!
+  // 5. Check Percentage (e.g. "#101 25% ho gaya")
   if (pctMatch) {
     const pct = Math.min(100, Math.max(0, parseInt(pctMatch[1], 10)));
     if (pct < 100) {
@@ -277,7 +309,7 @@ function parseIncomingReply(text, candidateTasks, isDirectChat) {
     }
   }
 
-  // 5. Check Delay / Blocker / Partial keywords
+  // 6. Check Delay / Blocker keywords (only when #ID or swipe-reply is used)
   if (/\b(delay|late|time lagega|kal|parson|ruk|atka|blocked|stuck|wait|baaki|baki|nahi hua|nhi hua|chalu hai|chal raha|kar raha|kr raha|working)\b|डिले|देरी|कल|बाकी|नहीं हुआ|चल रहा|कर रहा/i.test(lower)) {
     return {
       ignore: false,
@@ -307,8 +339,8 @@ function parseIncomingReply(text, candidateTasks, isDirectChat) {
     };
   }
 
-  // 6. Check if Employee claims "Done" / "ho gaya"
-  if (/\b(done|completed|complete|ho gaya|hogaya|ho gya|khatam|poora ho gaya|bhej diya|kar diya)\b|हो गया|पूरा हो गया|खत्म|भेज दिया|कर दिया/i.test(lower)) {
+  // 7. Check if Employee claims "Done" / "ho gaya" (only when #ID or swipe-reply is used)
+  if (/\b(done|completed|complete|ho gaya|hogaya|ho gya|khatam|poora ho gaya)\b|हो गया|पूरा हो गया|खत्म/i.test(lower)) {
     return {
       ignore: false,
       type: 'employee_claim_done',
@@ -318,17 +350,13 @@ function parseIncomingReply(text, candidateTasks, isDirectChat) {
     };
   }
 
-  // 7. General Q&A or any reply on a task (if employee tagged #103 OR replied in 1-on-1 chat with active task)
-  if ((hasExplicitId || (isDirectChat && candidateTasks.length > 0)) && raw.length >= 2) {
-    return {
-      ignore: false,
-      type: 'general_qa_note',
-      targetId: targetTaskId,
-      note: raw
-    };
-  }
-
-  return { ignore: true };
+  // 8. Any other question/answer tagged with #ID or swipe-replied to the bot
+  return {
+    ignore: false,
+    type: 'general_qa_note',
+    targetId: targetTaskId,
+    note: raw
+  };
 }
 
 function formatIntervalLabel(mins) {
@@ -447,7 +475,14 @@ async function startWhatsApp() {
         if (!text || !text.trim()) continue;
         const trimmed = text.trim();
 
-        // A. Assign new task(s) from WhatsApp: starts with "Task:" or "टास्क:"
+        // Extract quoted message text if the user swipe-replied to a bot message
+        const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+        const quotedText =
+          quotedMsg?.conversation ||
+          quotedMsg?.extendedTextMessage?.text ||
+          '';
+
+        // A. Assign new task(s) from WhatsApp ONLY when message starts with "Task:" or "टास्क:"
         if (/^(?:task|टास्क)\s*:/i.test(trimmed)) {
           const intervalMins = parseIntervalMinutes(trimmed, 120);
           const subTaskStrings = extractMultipleTasks(trimmed);
@@ -480,7 +515,7 @@ async function startWhatsApp() {
             const t = createdTasks[0];
             await sendWhatsAppMessage(
               remoteJid,
-              `📋 *NEW TASK ASSIGNED (#${t.id})*\n\n📌 *Task:* ${t.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(t.intervalMins)} (9 AM - 6 PM)\n\n💡 _Update देने के लिए लिखें: "#${t.id} 25% हो गया" या "#${t.id} थोड़ा डिले है"_\n🔒 _काम पूरा होने पर बॉस "Approve #${t.id}" लिखकर बंद करेंगे।_`
+              `📋 *NEW TASK ASSIGNED (#${t.id})*\n\n📌 *Task:* ${t.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(t.intervalMins)} (9 AM - 6 PM)\n\n💡 _Update देने के लिए इस मैसेज पर Reply करें या लिखें: "#${t.id} 25% हो गया"_\n🔒 _काम पूरा होने पर बॉस "Approve #${t.id}" लिखकर बंद करेंगे।_`
             );
           } else {
             const listStr = createdTasks
@@ -494,7 +529,7 @@ async function startWhatsApp() {
           continue;
         }
 
-        // B. Match active tasks
+        // B. Strict check for active tasks
         const allActiveTasks = store.tasks.filter(t => t.status !== 'completed');
         if (allActiveTasks.length === 0) continue;
 
@@ -505,26 +540,26 @@ async function startWhatsApp() {
             (senderPn && (t.chatId === senderPn || t.altChatId === senderPn))
         );
 
-        const isDirectChat = !remoteJid.endsWith('@g.us');
         const parsed = parseIncomingReply(
           trimmed,
-          chatMatchedTasks.length > 0 ? chatMatchedTasks : allActiveTasks,
-          isDirectChat
+          quotedText,
+          chatMatchedTasks,
+          allActiveTasks
         );
         if (parsed.ignore) continue;
 
-        // Handle Boss Approval
+        // Handle Boss Approval ("Approve #101" / "Close #101")
         if (parsed.type === 'manager_approve') {
           if (parsed.targetId === 'all') {
-            const toClose = chatMatchedTasks.length > 0 ? chatMatchedTasks : allActiveTasks;
-            toClose.forEach(t => {
+            if (chatMatchedTasks.length === 0) continue;
+            chatMatchedTasks.forEach(t => {
               t.status = 'completed';
               t.progress = 100;
             });
             saveStore();
             await sendWhatsAppMessage(
               remoteJid,
-              `✅ *ALL TASKS APPROVED & CLOSED*\n\nसभी ${toClose.length} टास्क बॉस द्वारा Complete मार्क कर दिए गए हैं। ऑटोमैटिक रिमाइंडर बंद हो गए हैं।`
+              `✅ *ALL TASKS APPROVED & CLOSED*\n\nइस चैट के सभी ${chatMatchedTasks.length} टास्क बॉस द्वारा Complete मार्क कर दिए गए हैं। ऑटोमैटिक रिमाइंडर बंद हो गए हैं।`
             );
           } else {
             const task = allActiveTasks.find(t => t.id === parsed.targetId);
@@ -544,6 +579,7 @@ async function startWhatsApp() {
         const task = allActiveTasks.find(t => t.id === parsed.targetId);
         if (!task) continue;
 
+        const isDirectChat = !remoteJid.endsWith('@g.us');
         if (isDirectChat && task.chatId !== remoteJid) {
           task.altChatId = task.chatId;
           task.chatId = remoteJid;
@@ -630,7 +666,7 @@ setInterval(async () => {
     } else {
       await sendWhatsAppMessage(
         task.chatId,
-        `⏰ *TASK REMINDER (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया अपना अपडेट दें: जैसे *"#${task.id} 40% हो गया"* या *"#${task.id} थोड़ा डिले है"*`
+        `⏰ *TASK REMINDER (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया इस मैसेज पर Reply करें या लिखें: *"#${task.id} 40% हो गया"*`
       );
     }
   }
@@ -733,7 +769,7 @@ app.post('/api/assign', async (req, res) => {
 
     await sendWhatsAppMessage(
       jid,
-      `📋 *NEW TASK ASSIGNED (#${newTask.id})*\n\n👤 *Assignee:* ${newTask.assignee}\n📌 *Task:* ${newTask.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(mins)} (9 AM - 6 PM)\n\n💡 _अपडेट देने के लिए लिखें: "#${newTask.id} 25% हो गया" या "#${newTask.id} थोड़ा डिले है"_`
+      `📋 *NEW TASK ASSIGNED (#${newTask.id})*\n\n👤 *Assignee:* ${newTask.assignee}\n📌 *Task:* ${newTask.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(mins)} (9 AM - 6 PM)\n\n💡 _अपडेट देने के लिए इस मैसेज पर Reply करें या लिखें: "#${newTask.id} 25% हो गया"_`
     );
   }
   saveStore();
@@ -755,6 +791,14 @@ app.post('/api/complete/:id', async (req, res) => {
   res.redirect('/');
 });
 
+// Silently delete a task from dashboard without sending any WhatsApp message
+app.post('/api/delete/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  store.tasks = store.tasks.filter(t => t.id !== id);
+  saveStore();
+  res.redirect('/');
+});
+
 app.get('/', async (req, res) => {
   const activeTasks = store.tasks.filter(t => t.status !== 'completed');
   const istNow = getISTDate();
@@ -772,7 +816,7 @@ app.get('/', async (req, res) => {
   <meta charset="UTF-8">
   <meta name="google" content="notranslate">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsTask Auto-Followup Bot v2.3</title>
+  <title>WhatsTask Auto-Followup Bot v2.4</title>
   <style>
     body { background:#0b1120; color:#f8fafc; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
     .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:520px; margin:0 auto 16px; }
@@ -790,8 +834,8 @@ app.get('/', async (req, res) => {
 </head>
 <body>
   <div class="card" style="text-align:center;">
-    <h1>WhatsTask Auto-Followup Bot v2.3</h1>
-    <p style="color:#94a3b8; font-size:13px; margin:0;">Smart % Tracking • Q&A Note • Multi-Task • Night DND</p>
+    <h1>WhatsTask Auto-Followup Bot v2.4</h1>
+    <p style="color:#94a3b8; font-size:13px; margin:0;">Strict #Task Matching • Anti-Spam • Night DND (6 PM - 9 AM)</p>
     <div id="statusBadgeContainer">
       ${isConnected
         ? '<span class="badge badge-ok">✅ WhatsApp Connected & Active</span>'
@@ -863,14 +907,13 @@ app.get('/', async (req, res) => {
   `}
 
   <div class="card" style="border-color:#14532d; background:#0c1f17;">
-    <h4 style="color:#4ade80; margin:0 0 8px;">💡 WhatsApp से एक या कई टास्क कैसे दें?</h4>
-    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">चैट या ग्रुप में ऐसे लिखें (समय के लिए [15m], [1h], [2h], [4h], या [24h] लगाएं):</p>
+    <h4 style="color:#4ade80; margin:0 0 8px;">💡 WhatsApp से टास्क और रिप्लाई कैसे काम करेगा?</h4>
+    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. नया टास्क देने के लिए शुरू में <b>Task:</b> लिखें:</p>
     <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">Task: @Rahul [2h]
 1. क्लाइंट को कोटेशन भेजो
 2. साइट की फोटो मंगवाओ</pre>
     <p style="font-size:12px; color:#94a3b8; margin:8px 0 0;">
-      • एम्प्लॉई कुछ भी जवाब देगा (जैसे <b>"#101 25% हो गया"</b> या कोई भी सवाल/जवाब), बॉट उसे नोट करेगा।<br>
-      • काम पूरा होने पर बॉस लिखेंगे: <b>"Approve #101"</b> या नीचे से Complete दबाएंगे।
+      2. <b>अन्य चैट में कोई डिस्टर्बेंस नहीं:</b> बॉट किसी भी सामान्य चैट या ग्रुप मैसेज पर तब तक नहीं बोलेगा जब तक मैसेज में <b>#101</b> न लिखा हो या बॉट के मैसेज को <b>Swipe Reply</b> न किया गया हो।
     </p>
   </div>
 
@@ -900,9 +943,14 @@ app.get('/', async (req, res) => {
           <div style="font-size:12px; color:#94a3b8; margin-top:4px;">Progress: <b>${t.progress}%</b> | Note: ${t.lastNote}</div>
           <div style="font-size:11px; color:#38bdf8; margin-top:2px;">${formatIntervalLabel(t.intervalMins)} ${t.status === 'pending_approval' ? '• 🔔 Needs Boss Approval' : ''}</div>
         </div>
-        <form method="POST" action="/api/complete/${t.id}" style="margin:0;">
-          <button type="submit" style="background:#059669; color:#fff; border:none; padding:8px 12px; border-radius:8px; font-weight:600; cursor:pointer;">Approve & Close</button>
-        </form>
+        <div style="display:flex; gap:6px;">
+          <form method="POST" action="/api/complete/${t.id}" style="margin:0;">
+            <button type="submit" style="background:#059669; color:#fff; border:none; padding:8px 10px; border-radius:8px; font-weight:600; cursor:pointer; font-size:12px;">Approve</button>
+          </form>
+          <form method="POST" action="/api/delete/${t.id}" style="margin:0;">
+            <button type="submit" style="background:#dc2626; color:#fff; border:none; padding:8px 10px; border-radius:8px; font-weight:600; cursor:pointer; font-size:12px;">🗑️</button>
+          </form>
+        </div>
       </div>
     `).join('')}
   </div>
