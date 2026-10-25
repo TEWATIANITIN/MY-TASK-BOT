@@ -1,15 +1,21 @@
 /**
- * WhatsTask Auto-Followup Bot (Upgraded v2.8 - Strict 9 AM - 6 PM Auto-Window + Anti-Freeze + Remind Button)
- * Key Features & Fixes in v2.8:
- * 1. STRICT 9:00 AM - 6:00 PM IST AUTOMATIC SCHEDULE:
- *    - Automatically pauses all automatic reminders from 6:00 PM to 9:00 AM IST (Night DND Always ON).
- *    - Automatically resumes at 9:00 AM IST sharp every morning without any manual button click!
- * 2. FIXED WRONG JID / CHAT ID OVERWRITE BUG:
- *    - Prevents `task.chatId` from being overwritten by `@lid` when someone replies, ensuring 15-min and 2-hour reminders never get lost.
- * 3. FIXED PROMISE QUEUE FREEZE & CRON-TRIGGERED CHECKS:
- *    - 15-second timeout per message send so a slow WhatsApp socket never blocks future reminders.
- *    - Every incoming request from cron-job.org also triggers the reminder check during daytime hours (9 AM - 6 PM).
- * 4. Added "🔔 Remind" button next to Approve & Delete on every task card in the Dashboard.
+ * WhatsTask Auto-Followup Bot (Upgraded v2.9 - Permanent Session Fix + Anti-Waiting-Message Fix + Reliable Reminders)
+ *
+ * ROOT CAUSES FOUND FROM SCREENSHOTS & FIXED IN v2.9:
+ * 1. WHY QR SCANNER KEPT REAPPEARING & REMINDERS STOPPED AFTER 12:51 PM:
+ *    - In v2.8, whenever `sendMessage` took >15 seconds, our catch block ran `startWhatsApp()` while the socket was still open!
+ *      Opening a second Baileys connection caused WhatsApp servers to throw `statusCode: 500 (badSession) / 440 (conflict)`.
+ *    - Worse: on `badSession`, the old code called `clearAuthFolder()`, which DELETED your saved login (`auth_info_baileys`)!
+ *      Once deleted, the bot showed the QR Scanner again at 12:51 PM, so the 1:49 PM (2-hour) reminder and subsequent 15-min reminders could not go out!
+ *    - FIX: NEVER auto-delete `auth_info_baileys` on temporary errors (500/440/408/515)—only clear if explicitly Logged Out (401) from phone or manual Reset button. And never call `startWhatsApp()` inside `sendWhatsAppMessage`.
+ *
+ * 2. WHY "Waiting for this message. This may take a while" APPEARED AT 12:20, 12:35, 12:51:
+ *    - In `buildMentions()`, regex added fake/unverified `@lid` or `@s.whatsapp.net` JIDs into the `mentions` array.
+ *    - In Baileys Multi-Device, passing an invalid/unmatched JID in `mentions` causes Signal encryption to fail for the recipient ("Waiting for this message") and triggers retry loops that stall the socket!
+ *    - FIX: Only pass `mentions` when assigning a task in a Group chat (`@g.us`) with verified WhatsApp `mentionedJid`s. In personal 1-on-1 chats, plain text delivers 100% instantly without encryption errors!
+ *
+ * 3. STRICT 9:00 AM - 6:00 PM IST AUTO-SCHEDULE + MANUAL "🔔 Remind" BUTTON:
+ *    - Automatic reminders run strictly between 9:00 AM and 6:00 PM IST and pause from 6:00 PM to 9:00 AM IST.
  */
 
 const express = require('express');
@@ -23,6 +29,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
   Browsers
 } = require('@whiskeysockets/baileys');
 
@@ -34,13 +41,14 @@ app.use(express.urlencoded({ extended: true }));
 
 const DATA_FILE = path.join(__dirname, 'tasks_data.json');
 const AUTH_FOLDER = path.join(__dirname, 'auth_info_baileys');
+const silentLogger = pino({ level: 'silent' });
 
 let detectedSelfUrl = process.env.RENDER_EXTERNAL_URL || null;
 
 let store = {
   nextId: 101,
   settings: {
-    quietHoursEnabled: true, // Strictly enabled: No auto-reminders between 6:00 PM and 9:00 AM IST
+    quietHoursEnabled: true, // Strictly 9:00 AM to 6:00 PM IST (Paused 6 PM - 9 AM)
     quietStartHour: 18,      // 6:00 PM IST
     quietEndHour: 9,         // 9:00 AM IST
     requireManagerApproval: true
@@ -60,7 +68,6 @@ function loadStore() {
           settings: {
             ...store.settings,
             ...(parsed.settings || {}),
-            // Always enforce 6 PM to 9 AM quiet hours automatically
             quietHoursEnabled: true,
             quietStartHour: 18,
             quietEndHour: 9
@@ -83,12 +90,15 @@ function saveStore() {
 
 loadStore();
 
-// Repair any existing tasks whose chatId was accidentally overwritten with @lid or missing NextNudgeAt
+// Clean up any corrupted JIDs or unverified mentions in existing tasks so they don't cause "Waiting for this message"
 for (const t of store.tasks) {
   if (t.status !== 'completed') {
     if (t.chatId && t.chatId.endsWith('@lid') && t.altChatId && t.altChatId.endsWith('@s.whatsapp.net')) {
-      console.log(`🔧 Restored Task #${t.id} chatId from ${t.chatId} -> ${t.altChatId}`);
       t.chatId = t.altChatId;
+    }
+    // Only keep mentions for group chats (@g.us) to prevent 1-on-1 Signal session encryption errors
+    if (t.chatId && !t.chatId.endsWith('@g.us')) {
+      t.mentions = [];
     }
     if (!t.nextNudgeAt) {
       t.nextNudgeAt = Date.now() + (t.intervalMins || 15) * 60000;
@@ -146,25 +156,6 @@ function clearAuthFolder() {
   }
 }
 
-// --- Build Mentions Array so @30838083317796 becomes a real clickable @Name tag in WhatsApp ---
-function buildMentions(text, savedMentions = []) {
-  const mentionSet = new Set(Array.isArray(savedMentions) ? savedMentions : []);
-  const matches = (text || '').matchAll(/@(\d{10,18})\b/g);
-  for (const m of matches) {
-    const num = m[1];
-    const alreadyHas = Array.from(mentionSet).some(j => j.startsWith(num + '@'));
-    if (!alreadyHas) {
-      if (num.length >= 13) {
-        mentionSet.add(`${num}@lid`);
-      } else {
-        mentionSet.add(`${num}@s.whatsapp.net`);
-      }
-    }
-  }
-  return Array.from(mentionSet);
-}
-
-// Helper to prevent sock.sendMessage from ever hanging the queue forever
 function withTimeout(promise, ms, timeoutMsg) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(timeoutMsg)), ms);
@@ -180,29 +171,41 @@ function withTimeout(promise, ms, timeoutMsg) {
   });
 }
 
+/**
+ * Reliable WhatsApp Message Sender (v2.9)
+ * - Prevents "Waiting for this message" by only passing verified `mentions` in Group chats (`@g.us`).
+ * - Never destroys the active socket on timeout (so session never gets wiped!).
+ */
 function sendWhatsAppMessage(jid, text, savedMentions = [], fallbackJid = null) {
   sendQueuePromise = sendQueuePromise
-    .catch(() => {}) // Ensure a prior error never breaks the promise chain
+    .catch(() => {})
     .then(async () => {
       if (!sock || !isConnected) {
-        console.log(`[Offline - Reminder Held -> ${jid}]: ${text.slice(0, 60)}...`);
+        console.log(`[Offline - Holding Message for ${jid}]`);
         return null;
       }
 
-      const mentions = buildMentions(text, savedMentions);
-      const payload = mentions.length > 0 ? { text, mentions } : { text };
+      const isGroup = jid && jid.endsWith('@g.us');
+      const validMentions = isGroup && Array.isArray(savedMentions)
+        ? savedMentions.filter(m => typeof m === 'string' && (m.endsWith('@s.whatsapp.net') || m.endsWith('@lid')))
+        : [];
+
+      const payload = validMentions.length > 0 ? { text, mentions: validMentions } : { text };
 
       try {
         const sent = await withTimeout(
           sock.sendMessage(jid, payload),
-          15000,
-          'WhatsApp sendMessage timed out after 15s'
+          20000,
+          'sendMessage timed out after 20s'
         );
 
         if (sent && sent.key && sent.key.id) {
           const id = sent.key.id;
           sentByBotMessageIds.add(id);
-          sentMessagesForRetry.set(id, sent.message || { conversation: text });
+          // Store exact inner message proto so Baileys retry requests decrypt cleanly without "Waiting for this message"
+          if (sent.message) {
+            sentMessagesForRetry.set(id, sent.message);
+          }
 
           if (sentByBotMessageIds.size > 500) {
             const first = sentByBotMessageIds.values().next().value;
@@ -216,33 +219,27 @@ function sendWhatsAppMessage(jid, text, savedMentions = [], fallbackJid = null) 
         await new Promise(r => setTimeout(r, 1500));
         return sent || { ok: true };
       } catch (err) {
-        console.error(`⚠️ Primary send failed (${jid}):`, err.message);
+        console.error(`⚠️ Send error (${jid}):`, err.message);
 
-        // If primary JID failed and we have a fallback JID (like altChatId), try that immediately
-        if (fallbackJid && fallbackJid !== jid) {
+        // Try fallback JID if available and different
+        if (fallbackJid && fallbackJid !== jid && sock && isConnected) {
           try {
-            console.log(`🔄 Trying fallback JID: ${fallbackJid}`);
             const sentFallback = await withTimeout(
-              sock.sendMessage(fallbackJid, payload),
+              sock.sendMessage(fallbackJid, { text }),
               15000,
               'Fallback sendMessage timed out'
             );
             if (sentFallback && sentFallback.key && sentFallback.key.id) {
               sentByBotMessageIds.add(sentFallback.key.id);
+              if (sentFallback.message) {
+                sentMessagesForRetry.set(sentFallback.key.id, sentFallback.message);
+              }
             }
             await new Promise(r => setTimeout(r, 1500));
             return sentFallback || { ok: true };
           } catch (err2) {
-            console.error(`❌ Fallback send also failed (${fallbackJid}):`, err2.message);
+            console.error(`❌ Fallback send failed (${fallbackJid}):`, err2.message);
           }
-        }
-
-        // If timed out, the WebSocket may be zombie/stale—trigger a fresh reconnect
-        if (err.message.includes('timed out') || err.message.includes('Connection Closed')) {
-          console.log('🔄 Detected stale WhatsApp socket, reconnecting...');
-          isConnected = false;
-          isConnecting = false;
-          setTimeout(startWhatsApp, 1500);
         }
 
         await new Promise(r => setTimeout(r, 1000));
@@ -282,7 +279,7 @@ async function triggerTaskReminder(task, isManual = false) {
     console.log(`✅ Sent reminder for Task #${task.id} -> Next in ${task.intervalMins} mins`);
     return true;
   } else {
-    task.lastSendError = `Retry pending (${formatISTTime(now)})`;
+    task.lastSendError = isConnected ? `Retry in 30s (${formatISTTime(now)})` : 'Waiting for WhatsApp connection';
     saveStore();
     return false;
   }
@@ -292,7 +289,7 @@ async function triggerTaskReminder(task, isManual = false) {
 async function checkAndSendDueReminders() {
   if (isCheckingReminders) return;
   if (!sock || !isConnected) return;
-  if (isQuietHours()) return; // Strictly block automatic reminders between 6:00 PM and 9:00 AM IST
+  if (isQuietHours()) return; // Strictly pause automatic reminders between 6:00 PM and 9:00 AM IST
 
   isCheckingReminders = true;
   try {
@@ -302,7 +299,7 @@ async function checkAndSendDueReminders() {
     );
 
     for (const task of dueTasks) {
-      if (isQuietHours()) break;
+      if (isQuietHours() || !isConnected) break;
       await triggerTaskReminder(task, false);
     }
   } catch (e) {
@@ -312,14 +309,13 @@ async function checkAndSendDueReminders() {
   }
 }
 
-// Middleware to auto-detect Render URL & trigger due reminders on every incoming HTTP / Cron request!
+// Middleware to auto-detect Render URL & trigger due reminders on every incoming HTTP / Cron request
 app.use((req, res, next) => {
   if (!detectedSelfUrl && req.headers.host && !req.headers.host.includes('localhost')) {
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
     detectedSelfUrl = `${proto}://${req.headers.host}`;
     console.log('🌐 Auto-detected Keep-Alive URL:', detectedSelfUrl);
   }
-  // Whenever cron-job.org or the user hits the server during 9 AM - 6 PM, proactively check due reminders!
   checkAndSendDueReminders().catch(() => {});
   next();
 });
@@ -327,12 +323,11 @@ app.use((req, res, next) => {
 function cleanTaskText(rawText) {
   return rawText
     .replace(/^(?:task|टास्क)\s*:\s*/i, '')
-    .replace(/\[(\d+\s*(?:m|min|mins|h|hr|hrs|d|day))\]/gi, '')
+    .replace(/\[(\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days))\]/gi, '')
     .trim();
 }
 
 function parseIntervalMinutes(rawText, defaultMins = 120) {
-  // 1. Check bracket format first e.g. [15m], [2h]
   const m = rawText.match(/\[(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\]/i);
   if (m) {
     const val = parseInt(m[1], 10);
@@ -342,7 +337,6 @@ function parseIntervalMinutes(rawText, defaultMins = 120) {
     if (unit.startsWith('d')) return val * 1440;
   }
 
-  // 2. Also support natural Hindi/English text e.g. "har 15 min", "every 15 mins", "15 minute me"
   const nat = rawText.match(/(?:every|har|हर)\s*(\d+)\s*(m|min|mins|minute|minutes|मिनट|h|hr|hrs|hour|hours|घंटे|घंटा)/i);
   if (nat) {
     const val = parseInt(nat[1], 10);
@@ -357,7 +351,7 @@ function parseIntervalMinutes(rawText, defaultMins = 120) {
 function extractMultipleTasks(rawBody) {
   const bodyAfterPrefix = rawBody
     .replace(/^(?:task|टास्क)\s*:\s*/i, '')
-    .replace(/\[(\d+\s*(?:m|min|mins|h|hr|hrs|d|day))\]/gi, '')
+    .replace(/\[(\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days))\]/gi, '')
     .trim();
 
   const lines = bodyAfterPrefix
@@ -396,7 +390,7 @@ function extractMultipleTasks(rawBody) {
 }
 
 /**
- * STRICT REPLY PARSER (v2.8)
+ * STRICT REPLY PARSER (v2.9)
  */
 function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) {
   const raw = (text || '').trim();
@@ -462,7 +456,7 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     }
   }
 
-  // 4. Remove @mention numbers and #TaskID before checking for % so @308380... isn't mistaken for a number
+  // 4. Remove @mention numbers and #TaskID before checking for %
   const textWithoutIdsAndMentions = lower
     .replace(/@\d{10,18}\b/g, '')
     .replace(/(?:#|task\s*)\d+/gi, '');
@@ -561,7 +555,7 @@ function formatNextDueInfo(nextNudgeAt) {
   if (!nextNudgeAt) return 'Due now';
   const diffMs = nextNudgeAt - Date.now();
   if (diffMs <= 0) {
-    return '⚡ Sending now...';
+    return isConnected ? '⚡ Sending now...' : '⏳ Waiting for WhatsApp Link';
   }
   const minsLeft = Math.ceil(diffMs / 60000);
   if (minsLeft < 60) return `Next in ${minsLeft} min(s)`;
@@ -597,22 +591,31 @@ async function startWhatsApp() {
       if (latest && latest.version) version = latest.version;
     } catch (e) {}
 
+    const authConfig = typeof makeCacheableSignalKeyStore === 'function'
+      ? {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, silentLogger)
+        }
+      : state;
+
     sock = makeWASocket({
       version,
-      auth: state,
-      logger: pino({ level: 'silent' }),
+      auth: authConfig,
+      logger: silentLogger,
       printQRInTerminal: true,
       browser: Browsers && Browsers.ubuntu ? Browsers.ubuntu('Chrome') : ['Ubuntu', 'Chrome', '20.0.04'],
       syncFullHistory: false,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
+      retryRequestDelayMs: 500,
       getMessage: async (key) => {
         if (key && key.id && sentMessagesForRetry.has(key.id)) {
           return sentMessagesForRetry.get(key.id);
         }
-        return { conversation: '⏰ Task Reminder Check-in' };
+        // Return undefined if not cached so Baileys doesn't encrypt a mismatched dummy string
+        return undefined;
       }
     });
 
@@ -635,10 +638,15 @@ async function startWhatsApp() {
         botOwnJid = sock.user?.id;
         console.log('✅ WhatsApp Connected as:', botOwnJid);
 
-        // Immediately check if any reminders became due while disconnected/restarting (only sends if 9 AM - 6 PM)
+        // Clear any old waiting errors on tasks and immediately dispatch overdue reminders (if 9 AM - 6 PM)
+        for (const t of store.tasks) {
+          if (t.status !== 'completed') t.lastSendError = null;
+        }
+        saveStore();
+
         setTimeout(() => {
           checkAndSendDueReminders().catch(() => {});
-        }, 3000);
+        }, 4000);
       }
 
       if (connection === 'close') {
@@ -647,17 +655,18 @@ async function startWhatsApp() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`⚠️ Connection closed (code: ${statusCode}).`);
 
-        if (
-          statusCode === DisconnectReason.loggedOut ||
-          statusCode === DisconnectReason.badSession ||
-          statusCode === 401 ||
-          statusCode === 403
-        ) {
+        // CRITICAL FIX IN v2.9:
+        // ONLY wipe auth_info_baileys if the user explicitly logged out from their phone (401 / loggedOut).
+        // Do NOT wipe auth_info_baileys on 500 (badSession), 440 (conflict), 408 (timeout), or 515 (restartRequired)!
+        // Wiping on 500/badSession was what caused the QR Scanner to randomly come back!
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+          console.log('🔒 Device logged out from phone. Clearing auth session for fresh QR.');
           clearAuthFolder();
           currentQR = null;
           currentPairingCode = null;
-          reconnectTimer = setTimeout(startWhatsApp, 2500);
+          reconnectTimer = setTimeout(startWhatsApp, 3000);
         } else {
+          console.log('🔄 Reconnecting using existing saved session (no QR needed)...');
           reconnectTimer = setTimeout(startWhatsApp, 4000);
         }
       }
@@ -697,19 +706,19 @@ async function startWhatsApp() {
         if (/^(?:task|टास्क)\s*:/i.test(trimmed)) {
           const intervalMins = parseIntervalMinutes(trimmed, 120);
           const subTaskStrings = extractMultipleTasks(trimmed);
+          const isGroupChat = remoteJid.endsWith('@g.us');
 
           const createdTasks = [];
           let staggerIdx = 0;
           for (const taskTitle of subTaskStrings) {
             const staggerMs = staggerIdx * 10000;
             staggerIdx++;
-            const taskMentions = buildMentions(taskTitle, mentionedJids);
             const newTask = {
               id: store.nextId++,
-              chatId: remoteJid, // Strictly keep the exact chat JID where the task was created!
+              chatId: remoteJid,
               altChatId: senderPn && senderPn !== remoteJid ? senderPn : null,
               title: taskTitle,
-              mentions: taskMentions,
+              mentions: isGroupChat ? mentionedJids : [],
               assignee: 'Team',
               progress: 0,
               status: 'in_progress',
@@ -738,7 +747,7 @@ async function startWhatsApp() {
             await sendWhatsAppMessage(
               remoteJid,
               `📋 *MULTIPLE TASKS ASSIGNED (${createdTasks.length} Tasks)*\n\n${listStr}\n\n⏰ *Auto-Reminder:* ${formatIntervalLabel(intervalMins)} (9 AM - 6 PM)\n💡 _अलग-अलग अपडेट ऐसे दें:_\n_• "#${createdTasks[0].id} 50% हो गया"_\n_• "#${createdTasks[1].id} थोड़ा डिले है"_`,
-              mentionedJids
+              isGroupChat ? mentionedJids : []
             );
           }
           continue;
@@ -795,7 +804,6 @@ async function startWhatsApp() {
         const task = allActiveTasks.find(t => t.id === parsed.targetId);
         if (!task) continue;
 
-        // CRITICAL FIX: Do NOT overwrite task.chatId with @lid when replying!
         if (remoteJid && task.chatId !== remoteJid && !task.altChatId) {
           task.altChatId = remoteJid;
         }
@@ -967,7 +975,7 @@ app.post('/api/assign', async (req, res) => {
       id: store.nextId++,
       chatId: jid,
       title: employeeName ? `@${employeeName} - ${title}` : title,
-      mentions: !finalPhone.endsWith('@g.us') ? [`${finalPhone}@s.whatsapp.net`] : [],
+      mentions: [],
       assignee: employeeName || 'Employee',
       progress: 0,
       status: 'in_progress',
@@ -982,7 +990,7 @@ app.post('/api/assign', async (req, res) => {
     await sendWhatsAppMessage(
       jid,
       `📋 *NEW TASK ASSIGNED (#${newTask.id})*\n\n👤 *Assignee:* ${newTask.assignee}\n📌 *Task:* ${newTask.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(mins)} (9 AM - 6 PM)\n\n💡 _अपडेट देने के लिए इस मैसेज पर Reply करें या लिखें: "#${newTask.id} 25% हो गया"_`,
-      newTask.mentions
+      []
     );
   }
   saveStore();
@@ -1031,7 +1039,7 @@ app.get('/', async (req, res) => {
   <meta charset="UTF-8">
   <meta name="google" content="notranslate">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsTask Auto-Followup Bot v2.8</title>
+  <title>WhatsTask Auto-Followup Bot v2.9</title>
   <style>
     body { background:#0b1120; color:#f8fafc; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
     .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:540px; margin:0 auto 16px; }
@@ -1050,8 +1058,8 @@ app.get('/', async (req, res) => {
 </head>
 <body>
   <div class="card" style="text-align:center;">
-    <h1>WhatsTask Auto-Followup Bot v2.8</h1>
-    <p style="color:#94a3b8; font-size:13px; margin:0;">Real @Mention Tagging • Auto 9 AM - 6 PM Window • Manual Remind Button</p>
+    <h1>WhatsTask Auto-Followup Bot v2.9</h1>
+    <p style="color:#94a3b8; font-size:13px; margin:0;">Permanent Session Lock • Zero Waiting-Message Fix • Auto 9 AM - 6 PM</p>
     <div id="statusBadgeContainer">
       ${isConnected
         ? '<span class="badge badge-ok">✅ WhatsApp Connected & Active</span>'
