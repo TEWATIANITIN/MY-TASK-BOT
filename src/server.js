@@ -1,10 +1,15 @@
 /**
- * WhatsTask Auto-Followup Bot (Upgraded v2.5 - Real @Mention Tagging Fix)
- * Key Fixes in v2.5:
- * 1. Passes `mentions` array in sock.sendMessage so @30838083317796 renders as real clickable @Name tag in WhatsApp!
- * 2. Tags the assigned person on every automatic reminder as well.
- * 3. Strict #Task Matching & Anti-Spam (never interrupts normal group/personal chats).
- * 4. Fixes "Waiting for this message" via getMessage retry store & 2s queue.
+ * WhatsTask Auto-Followup Bot (Upgraded v2.8 - Strict 9 AM - 6 PM Auto-Window + Anti-Freeze + Remind Button)
+ * Key Features & Fixes in v2.8:
+ * 1. STRICT 9:00 AM - 6:00 PM IST AUTOMATIC SCHEDULE:
+ *    - Automatically pauses all automatic reminders from 6:00 PM to 9:00 AM IST (Night DND Always ON).
+ *    - Automatically resumes at 9:00 AM IST sharp every morning without any manual button click!
+ * 2. FIXED WRONG JID / CHAT ID OVERWRITE BUG:
+ *    - Prevents `task.chatId` from being overwritten by `@lid` when someone replies, ensuring 15-min and 2-hour reminders never get lost.
+ * 3. FIXED PROMISE QUEUE FREEZE & CRON-TRIGGERED CHECKS:
+ *    - 15-second timeout per message send so a slow WhatsApp socket never blocks future reminders.
+ *    - Every incoming request from cron-job.org also triggers the reminder check during daytime hours (9 AM - 6 PM).
+ * 4. Added "🔔 Remind" button next to Approve & Delete on every task card in the Dashboard.
  */
 
 const express = require('express');
@@ -30,12 +35,14 @@ app.use(express.urlencoded({ extended: true }));
 const DATA_FILE = path.join(__dirname, 'tasks_data.json');
 const AUTH_FOLDER = path.join(__dirname, 'auth_info_baileys');
 
+let detectedSelfUrl = process.env.RENDER_EXTERNAL_URL || null;
+
 let store = {
   nextId: 101,
   settings: {
-    quietHoursEnabled: true,
-    quietStartHour: 18, // 6:00 PM IST
-    quietEndHour: 9,    // 9:00 AM IST
+    quietHoursEnabled: true, // Strictly enabled: No auto-reminders between 6:00 PM and 9:00 AM IST
+    quietStartHour: 18,      // 6:00 PM IST
+    quietEndHour: 9,         // 9:00 AM IST
     requireManagerApproval: true
   },
   tasks: []
@@ -47,7 +54,18 @@ function loadStore() {
       const raw = fs.readFileSync(DATA_FILE, 'utf8');
       const parsed = JSON.parse(raw);
       if (parsed && Array.isArray(parsed.tasks)) {
-        store = { ...store, ...parsed };
+        store = {
+          ...store,
+          ...parsed,
+          settings: {
+            ...store.settings,
+            ...(parsed.settings || {}),
+            // Always enforce 6 PM to 9 AM quiet hours automatically
+            quietHoursEnabled: true,
+            quietStartHour: 18,
+            quietEndHour: 9
+          }
+        };
       }
     }
   } catch (e) {
@@ -65,18 +83,39 @@ function saveStore() {
 
 loadStore();
 
+// Repair any existing tasks whose chatId was accidentally overwritten with @lid or missing NextNudgeAt
+for (const t of store.tasks) {
+  if (t.status !== 'completed') {
+    if (t.chatId && t.chatId.endsWith('@lid') && t.altChatId && t.altChatId.endsWith('@s.whatsapp.net')) {
+      console.log(`🔧 Restored Task #${t.id} chatId from ${t.chatId} -> ${t.altChatId}`);
+      t.chatId = t.altChatId;
+    }
+    if (!t.nextNudgeAt) {
+      t.nextNudgeAt = Date.now() + (t.intervalMins || 15) * 60000;
+    }
+  }
+}
+saveStore();
+
 function getISTDate() {
   const now = new Date();
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
   return new Date(utcMs + 5.5 * 3600000);
 }
 
+function formatISTTime(timestampMs) {
+  if (!timestampMs) return 'Never';
+  const d = new Date(timestampMs);
+  const utcMs = d.getTime() + d.getTimezoneOffset() * 60000;
+  const ist = new Date(utcMs + 5.5 * 3600000);
+  return ist.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+}
+
 function isQuietHours() {
-  if (!store.settings.quietHoursEnabled) return false;
   const ist = getISTDate();
   const hour = ist.getHours();
-  const start = store.settings.quietStartHour;
-  const end = store.settings.quietEndHour;
+  const start = store.settings.quietStartHour; // 18 (6 PM)
+  const end = store.settings.quietEndHour;     // 9  (9 AM)
   if (start > end) {
     return hour >= start || hour < end;
   }
@@ -90,6 +129,7 @@ let isConnected = false;
 let isConnecting = false;
 let reconnectTimer = null;
 let botOwnJid = null;
+let isCheckingReminders = false;
 
 const sentByBotMessageIds = new Set();
 const sentMessagesForRetry = new Map();
@@ -124,40 +164,165 @@ function buildMentions(text, savedMentions = []) {
   return Array.from(mentionSet);
 }
 
-function sendWhatsAppMessage(jid, text, savedMentions = []) {
-  sendQueuePromise = sendQueuePromise.then(async () => {
-    if (!sock || !isConnected) {
-      console.log(`[Offline Queue -> ${jid}]: ${text}`);
-      return null;
-    }
-    try {
+// Helper to prevent sock.sendMessage from ever hanging the queue forever
+function withTimeout(promise, ms, timeoutMsg) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(timeoutMsg)), ms);
+    promise
+      .then(val => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch(err => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+function sendWhatsAppMessage(jid, text, savedMentions = [], fallbackJid = null) {
+  sendQueuePromise = sendQueuePromise
+    .catch(() => {}) // Ensure a prior error never breaks the promise chain
+    .then(async () => {
+      if (!sock || !isConnected) {
+        console.log(`[Offline - Reminder Held -> ${jid}]: ${text.slice(0, 60)}...`);
+        return null;
+      }
+
       const mentions = buildMentions(text, savedMentions);
       const payload = mentions.length > 0 ? { text, mentions } : { text };
-      const sent = await sock.sendMessage(jid, payload);
-      if (sent && sent.key && sent.key.id) {
-        const id = sent.key.id;
-        sentByBotMessageIds.add(id);
-        sentMessagesForRetry.set(id, sent.message || { conversation: text });
 
-        if (sentByBotMessageIds.size > 500) {
-          const first = sentByBotMessageIds.values().next().value;
-          sentByBotMessageIds.delete(first);
+      try {
+        const sent = await withTimeout(
+          sock.sendMessage(jid, payload),
+          15000,
+          'WhatsApp sendMessage timed out after 15s'
+        );
+
+        if (sent && sent.key && sent.key.id) {
+          const id = sent.key.id;
+          sentByBotMessageIds.add(id);
+          sentMessagesForRetry.set(id, sent.message || { conversation: text });
+
+          if (sentByBotMessageIds.size > 500) {
+            const first = sentByBotMessageIds.values().next().value;
+            sentByBotMessageIds.delete(first);
+          }
+          if (sentMessagesForRetry.size > 500) {
+            const firstKey = sentMessagesForRetry.keys().next().value;
+            sentMessagesForRetry.delete(firstKey);
+          }
         }
-        if (sentMessagesForRetry.size > 500) {
-          const firstKey = sentMessagesForRetry.keys().next().value;
-          sentMessagesForRetry.delete(firstKey);
+        await new Promise(r => setTimeout(r, 1500));
+        return sent || { ok: true };
+      } catch (err) {
+        console.error(`⚠️ Primary send failed (${jid}):`, err.message);
+
+        // If primary JID failed and we have a fallback JID (like altChatId), try that immediately
+        if (fallbackJid && fallbackJid !== jid) {
+          try {
+            console.log(`🔄 Trying fallback JID: ${fallbackJid}`);
+            const sentFallback = await withTimeout(
+              sock.sendMessage(fallbackJid, payload),
+              15000,
+              'Fallback sendMessage timed out'
+            );
+            if (sentFallback && sentFallback.key && sentFallback.key.id) {
+              sentByBotMessageIds.add(sentFallback.key.id);
+            }
+            await new Promise(r => setTimeout(r, 1500));
+            return sentFallback || { ok: true };
+          } catch (err2) {
+            console.error(`❌ Fallback send also failed (${fallbackJid}):`, err2.message);
+          }
         }
+
+        // If timed out, the WebSocket may be zombie/stale—trigger a fresh reconnect
+        if (err.message.includes('timed out') || err.message.includes('Connection Closed')) {
+          console.log('🔄 Detected stale WhatsApp socket, reconnecting...');
+          isConnected = false;
+          isConnecting = false;
+          setTimeout(startWhatsApp, 1500);
+        }
+
+        await new Promise(r => setTimeout(r, 1000));
+        return null;
       }
-      await new Promise(r => setTimeout(r, 2000));
-      return sent;
-    } catch (err) {
-      console.error('Failed to send WhatsApp message:', err.message);
-      await new Promise(r => setTimeout(r, 1000));
-      return null;
-    }
-  });
+    });
   return sendQueuePromise;
 }
+
+// Send a reminder for a single task (used by both auto-scheduler & manual button)
+async function triggerTaskReminder(task, isManual = false) {
+  const now = Date.now();
+  const headerPrefix = isManual ? '🔔 *MANUAL REMINDER' : '⏰ *TASK REMINDER';
+
+  let sentResult = null;
+  if (task.status === 'pending_approval') {
+    sentResult = await sendWhatsAppMessage(
+      task.chatId,
+      `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम पूरा रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`,
+      task.mentions,
+      task.altChatId
+    );
+  } else {
+    sentResult = await sendWhatsAppMessage(
+      task.chatId,
+      `${headerPrefix} (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress}% पूरा हुआ (${100 - task.progress}% बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया इस मैसेज पर Reply करें या लिखें: *"#${task.id} 40% हो गया"*`,
+      task.mentions,
+      task.altChatId
+    );
+  }
+
+  if (sentResult) {
+    task.lastNudgeAt = Date.now();
+    task.nextNudgeAt = Date.now() + (task.intervalMins || 120) * 60000;
+    task.lastSendError = null;
+    saveStore();
+    console.log(`✅ Sent reminder for Task #${task.id} -> Next in ${task.intervalMins} mins`);
+    return true;
+  } else {
+    task.lastSendError = `Retry pending (${formatISTTime(now)})`;
+    saveStore();
+    return false;
+  }
+}
+
+// Check and dispatch any due reminders (Strictly runs only between 9:00 AM and 6:00 PM IST)
+async function checkAndSendDueReminders() {
+  if (isCheckingReminders) return;
+  if (!sock || !isConnected) return;
+  if (isQuietHours()) return; // Strictly block automatic reminders between 6:00 PM and 9:00 AM IST
+
+  isCheckingReminders = true;
+  try {
+    const now = Date.now();
+    const dueTasks = store.tasks.filter(
+      t => t.status !== 'completed' && (!t.nextNudgeAt || t.nextNudgeAt <= now)
+    );
+
+    for (const task of dueTasks) {
+      if (isQuietHours()) break;
+      await triggerTaskReminder(task, false);
+    }
+  } catch (e) {
+    console.error('Error in checkAndSendDueReminders:', e.message);
+  } finally {
+    isCheckingReminders = false;
+  }
+}
+
+// Middleware to auto-detect Render URL & trigger due reminders on every incoming HTTP / Cron request!
+app.use((req, res, next) => {
+  if (!detectedSelfUrl && req.headers.host && !req.headers.host.includes('localhost')) {
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    detectedSelfUrl = `${proto}://${req.headers.host}`;
+    console.log('🌐 Auto-detected Keep-Alive URL:', detectedSelfUrl);
+  }
+  // Whenever cron-job.org or the user hits the server during 9 AM - 6 PM, proactively check due reminders!
+  checkAndSendDueReminders().catch(() => {});
+  next();
+});
 
 function cleanTaskText(rawText) {
   return rawText
@@ -167,13 +332,25 @@ function cleanTaskText(rawText) {
 }
 
 function parseIntervalMinutes(rawText, defaultMins = 120) {
-  const m = rawText.match(/\[(\d+)\s*(m|min|mins|h|hr|hrs|d|day)\]/i);
-  if (!m) return defaultMins;
-  const val = parseInt(m[1], 10);
-  const unit = m[2].toLowerCase();
-  if (unit.startsWith('m')) return Math.max(15, val);
-  if (unit.startsWith('h')) return val * 60;
-  if (unit.startsWith('d')) return val * 1440;
+  // 1. Check bracket format first e.g. [15m], [2h]
+  const m = rawText.match(/\[(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\]/i);
+  if (m) {
+    const val = parseInt(m[1], 10);
+    const unit = m[2].toLowerCase();
+    if (unit.startsWith('m')) return Math.max(5, val);
+    if (unit.startsWith('h')) return val * 60;
+    if (unit.startsWith('d')) return val * 1440;
+  }
+
+  // 2. Also support natural Hindi/English text e.g. "har 15 min", "every 15 mins", "15 minute me"
+  const nat = rawText.match(/(?:every|har|हर)\s*(\d+)\s*(m|min|mins|minute|minutes|मिनट|h|hr|hrs|hour|hours|घंटे|घंटा)/i);
+  if (nat) {
+    const val = parseInt(nat[1], 10);
+    const unit = nat[2].toLowerCase();
+    if (unit.startsWith('m') || unit.includes('मिनट')) return Math.max(5, val);
+    if (unit.startsWith('h') || unit.includes('घंट')) return val * 60;
+  }
+
   return defaultMins;
 }
 
@@ -219,7 +396,7 @@ function extractMultipleTasks(rawBody) {
 }
 
 /**
- * STRICT REPLY PARSER (v2.5)
+ * STRICT REPLY PARSER (v2.8)
  */
 function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) {
   const raw = (text || '').trim();
@@ -242,6 +419,7 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     lower.includes('task completed') ||
     lower.includes('next check-in') ||
     lower.includes('auto-reminder:') ||
+    lower.includes('manual reminder') ||
     lower.includes('approval needed') ||
     lower.includes('pending boss approval') ||
     lower.includes('delay / status noted') ||
@@ -376,6 +554,22 @@ function formatIntervalLabel(mins) {
   return `Every ${mins} Mins`;
 }
 
+function formatNextDueInfo(nextNudgeAt) {
+  if (isQuietHours()) {
+    return '🌙 Paused (6 PM - 9 AM) • Resumes at 9:00 AM';
+  }
+  if (!nextNudgeAt) return 'Due now';
+  const diffMs = nextNudgeAt - Date.now();
+  if (diffMs <= 0) {
+    return '⚡ Sending now...';
+  }
+  const minsLeft = Math.ceil(diffMs / 60000);
+  if (minsLeft < 60) return `Next in ${minsLeft} min(s)`;
+  const hrs = Math.floor(minsLeft / 60);
+  const remMins = minsLeft % 60;
+  return `Next in ${hrs}h ${remMins}m`;
+}
+
 async function startWhatsApp() {
   if (isConnecting) return;
   isConnecting = true;
@@ -440,6 +634,11 @@ async function startWhatsApp() {
         isConnecting = false;
         botOwnJid = sock.user?.id;
         console.log('✅ WhatsApp Connected as:', botOwnJid);
+
+        // Immediately check if any reminders became due while disconnected/restarting (only sends if 9 AM - 6 PM)
+        setTimeout(() => {
+          checkAndSendDueReminders().catch(() => {});
+        }, 3000);
       }
 
       if (connection === 'close') {
@@ -507,8 +706,8 @@ async function startWhatsApp() {
             const taskMentions = buildMentions(taskTitle, mentionedJids);
             const newTask = {
               id: store.nextId++,
-              chatId: remoteJid,
-              altChatId: senderPn,
+              chatId: remoteJid, // Strictly keep the exact chat JID where the task was created!
+              altChatId: senderPn && senderPn !== remoteJid ? senderPn : null,
               title: taskTitle,
               mentions: taskMentions,
               assignee: 'Team',
@@ -534,7 +733,7 @@ async function startWhatsApp() {
             );
           } else {
             const listStr = createdTasks
-              .map(t => `🔹 *#${t.id}:* ${t.title} (0 पूरा हुआ)`)
+              .map(t => `🔹 *#${t.id}:* ${t.title} (0% पूरा हुआ)`)
               .join('\n');
             await sendWhatsAppMessage(
               remoteJid,
@@ -596,10 +795,9 @@ async function startWhatsApp() {
         const task = allActiveTasks.find(t => t.id === parsed.targetId);
         if (!task) continue;
 
-        const isDirectChat = !remoteJid.endsWith('@g.us');
-        if (isDirectChat && task.chatId !== remoteJid) {
-          task.altChatId = task.chatId;
-          task.chatId = remoteJid;
+        // CRITICAL FIX: Do NOT overwrite task.chatId with @lid when replying!
+        if (remoteJid && task.chatId !== remoteJid && !task.altChatId) {
+          task.altChatId = remoteJid;
         }
 
         if (parsed.type === 'progress_update') {
@@ -611,7 +809,7 @@ async function startWhatsApp() {
 
           await sendWhatsAppMessage(
             remoteJid,
-            `📊 *TASK UPDATE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n⏰ *Next Reminder:* ${formatIntervalLabel(task.intervalMins)}`,
+            `📊 *TASK UPDATE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Progress:* ${task.progress}% पूरा हुआ (${100 - task.progress}% बाकी है)\n⏰ *Next Reminder:* ${formatIntervalLabel(task.intervalMins)} (9 AM - 6 PM)`,
             task.mentions
           );
         } else if (parsed.type === 'delay_or_note') {
@@ -621,7 +819,7 @@ async function startWhatsApp() {
 
           await sendWhatsAppMessage(
             remoteJid,
-            `⚠️ *DELAY / STATUS NOTED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📝 *Update:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n⏰ _रिमाइंडर चालू रहेगा। कृपया साथ में काम का प्रतिशत भी बताएं।_`,
+            `⚠️ *DELAY / STATUS NOTED (#${task.id})*\n\n📌 *Task:* ${task.title}\n📝 *Update:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress}% पूरा हुआ\n⏰ _रिमाइंडर (9 AM - 6 PM) चालू रहेगा। कृपया साथ में काम का प्रतिशत भी बताएं।_`,
             task.mentions
           );
         } else if (parsed.type === 'general_qa_note') {
@@ -630,7 +828,7 @@ async function startWhatsApp() {
 
           await sendWhatsAppMessage(
             remoteJid,
-            `📝 *NOTE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n💬 *Reply:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress} पूरा हुआ\n\n👉 _कृपया यह भी बताएं कि काम कितने प्रतिशत हुआ है (जैसे: "#${task.id} 25 percent ho gaya")।_`,
+            `📝 *NOTE RECORDED (#${task.id})*\n\n📌 *Task:* ${task.title}\n💬 *Reply:* "${parsed.note}"\n📈 *Current Progress:* ${task.progress}% पूरा हुआ\n\n👉 _कृपया यह भी बताएं कि काम कितने प्रतिशत हुआ है (जैसे: "#${task.id} 25 percent ho gaya")।_`,
             task.mentions
           );
         } else if (parsed.type === 'employee_claim_done') {
@@ -644,7 +842,7 @@ async function startWhatsApp() {
 
             await sendWhatsAppMessage(
               remoteJid,
-              `🔔 *APPROVAL NEEDED (#${task.id})*\n\n📌 *Task:* ${task.title}\nएम्प्लॉई ने लिखा है कि काम पूरा हो गया है ("${parsed.note}")।\n\n👉 *बॉस ध्यान दें:* रिमाइंडर बंद करने के लिए कृपया *"Approve #${task.id}"* या *"Close #${task.id}"* लिखें (या डैशबोर्ड से Complete दबाएं)।`,
+              `🔔 *APPROVAL NEEDED (#${task.id})*\n\n📌 *Task:* ${task.title}\nएम्प्लॉई ने लिखा है कि काम पूरा हो गया है ("${parsed.note}")।\n\n👉 *बॉस ध्यान दें:* रिमाइंडर बंद करने के लिए कृपया *"Approve #${task.id}"* या *"Close #${task.id}"* लिखें (या डैशबोर्ड से Approve दबाएं)।`,
               task.mentions
             );
           } else {
@@ -666,42 +864,19 @@ async function startWhatsApp() {
   }
 }
 
-// --- Background Reminder Scheduler (Runs every 60 seconds) ---
-setInterval(async () => {
-  if (isQuietHours()) return;
-
-  const now = Date.now();
-  const dueTasks = store.tasks.filter(
-    t => t.status !== 'completed' && t.nextNudgeAt && t.nextNudgeAt <= now
-  );
-
-  for (const task of dueTasks) {
-    task.nextNudgeAt = now + task.intervalMins * 60000;
-    task.lastNudgeAt = now;
-    saveStore();
-
-    if (task.status === 'pending_approval') {
-      await sendWhatsAppMessage(
-        task.chatId,
-        `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम पूरा रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`,
-        task.mentions
-      );
-    } else {
-      await sendWhatsAppMessage(
-        task.chatId,
-        `⏰ *TASK REMINDER (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress} पूरा हुआ (${100 - task.progress} बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया इस मैसेज पर Reply करें या लिखें: *"#${task.id} 40% हो गया"*`,
-        task.mentions
-      );
-    }
-  }
-}, 60000);
+// --- Background Reminder Scheduler (Checks every 30 seconds, sends ONLY between 9:00 AM and 6:00 PM IST) ---
+setInterval(() => {
+  checkAndSendDueReminders().catch(err => {
+    console.error('Scheduler error:', err.message);
+  });
+}, 30000);
 
 // --- Internal Keep-Alive Self-Ping (Every 4 minutes) ---
 setInterval(() => {
-  const renderUrl = process.env.RENDER_EXTERNAL_URL;
-  if (renderUrl) {
-    const client = renderUrl.startsWith('https') ? https : http;
-    client.get(renderUrl, (res) => {
+  const targetUrl = detectedSelfUrl || process.env.RENDER_EXTERNAL_URL;
+  if (targetUrl) {
+    const client = targetUrl.startsWith('https') ? https : http;
+    client.get(`${targetUrl}/api/status`, (res) => {
       res.resume();
     }).on('error', () => {});
   }
@@ -714,8 +889,20 @@ app.get('/api/status', (req, res) => {
   res.json({
     isConnected,
     qrImageUrl,
-    pairingCode: currentPairingCode || null
+    pairingCode: currentPairingCode || null,
+    isQuietHours: isQuietHours(),
+    activeTasksCount: store.tasks.filter(t => t.status !== 'completed').length
   });
+});
+
+// Manual Remind Now endpoint for individual task (Works anytime when you click 🔔 Remind)
+app.post('/api/remind/:id', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const task = store.tasks.find(t => t.id === id && t.status !== 'completed');
+  if (task) {
+    await triggerTaskReminder(task, true);
+  }
+  res.redirect('/?reminded=' + id);
 });
 
 app.post('/api/pair-phone', async (req, res) => {
@@ -812,7 +999,8 @@ app.post('/api/complete/:id', async (req, res) => {
     await sendWhatsAppMessage(
       task.chatId,
       `✅ *TASK APPROVED & COMPLETED (#${task.id})*\n\n📌 "${task.title}" को डैशबोर्ड से Complete कर दिया गया है। अब रिमाइंडर बंद हो गए हैं।`,
-      task.mentions
+      task.mentions,
+      task.altChatId
     );
   }
   res.redirect('/');
@@ -830,6 +1018,7 @@ app.get('/', async (req, res) => {
   const istNow = getISTDate();
   const timeStr = istNow.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
   const quietNow = isQuietHours();
+  const remindedId = req.query.reminded ? parseInt(req.query.reminded, 10) : null;
 
   let qrImageUrl = '';
   if (currentQR) {
@@ -842,10 +1031,10 @@ app.get('/', async (req, res) => {
   <meta charset="UTF-8">
   <meta name="google" content="notranslate">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsTask Auto-Followup Bot v2.5</title>
+  <title>WhatsTask Auto-Followup Bot v2.8</title>
   <style>
     body { background:#0b1120; color:#f8fafc; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
-    .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:520px; margin:0 auto 16px; }
+    .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:540px; margin:0 auto 16px; }
     h1 { color:#25d366; margin:0 0 8px; font-size:22px; }
     .badge { display:inline-block; padding:6px 14px; border-radius:99px; font-size:13px; font-weight:600; margin-top:8px; }
     .badge-ok { background:#064e3b; color:#34d399; }
@@ -854,21 +1043,30 @@ app.get('/', async (req, res) => {
     .btn { width:100%; padding:13px; border:none; border-radius:10px; background:#16a34a; color:#fff; font-weight:700; font-size:15px; cursor:pointer; }
     .btn-blue { background:#2563eb; }
     .btn-red { background:#dc2626; padding:10px; font-size:13px; margin-top:8px; }
-    .task-row { background:#0f172a; border:1px solid #1e293b; border-radius:12px; padding:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .task-row { background:#0f172a; border:1px solid #1e293b; border-radius:12px; padding:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
     .pair-box { background:#0f172a; border:2px dashed #38bdf8; border-radius:12px; padding:14px; margin-top:12px; font-size:26px; font-weight:800; letter-spacing:4px; color:#38bdf8; }
+    .toast { background:#065f46; border:1px solid #10b981; color:#ecfdf5; padding:10px 14px; border-radius:10px; font-size:13px; margin-bottom:12px; text-align:center; font-weight:600; }
   </style>
 </head>
 <body>
   <div class="card" style="text-align:center;">
-    <h1>WhatsTask Auto-Followup Bot v2.5</h1>
-    <p style="color:#94a3b8; font-size:13px; margin:0;">Real @Mention Tagging • Strict #Task Matching • Night DND</p>
+    <h1>WhatsTask Auto-Followup Bot v2.8</h1>
+    <p style="color:#94a3b8; font-size:13px; margin:0;">Real @Mention Tagging • Auto 9 AM - 6 PM Window • Manual Remind Button</p>
     <div id="statusBadgeContainer">
       ${isConnected
         ? '<span class="badge badge-ok">✅ WhatsApp Connected & Active</span>'
         : '<span class="badge badge-warn">📱 Link WhatsApp Below (QR or Phone Number)</span>'}
     </div>
-    <p style="font-size:12px; color:#64748b; margin-top:8px;">IST Time: ${timeStr} | Night DND (6PM-9AM): <b>${quietNow ? '🌙 Sleeping' : '☀️ Active'}</b></p>
+    <p style="font-size:12px; color:#94a3b8; margin-top:10px; margin-bottom:0;">
+      IST Time: <b>${timeStr}</b> | Auto-Schedule (9 AM - 6 PM): <b>${quietNow ? '🌙 Night DND (Paused 6PM-9AM)' : '☀️ Daytime Active (Sending Reminders)'}</b>
+    </p>
   </div>
+
+  ${remindedId ? `
+  <div class="card" style="padding:0; background:transparent; border:none;">
+    <div class="toast">🔔 Task #${remindedId} का रिमाइंडर WhatsApp पर तुरंत भेज दिया गया है!</div>
+  </div>
+  ` : ''}
 
   ${!isConnected ? `
   <div class="card" style="text-align:center;">
@@ -934,12 +1132,12 @@ app.get('/', async (req, res) => {
 
   <div class="card" style="border-color:#14532d; background:#0c1f17;">
     <h4 style="color:#4ade80; margin:0 0 8px;">💡 WhatsApp से टास्क और रिप्लाई कैसे काम करेगा?</h4>
-    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. नया टास्क देने के लिए शुरू में <b>Task:</b> लिखें और व्यक्ति को <b>@</b> से टैग करें:</p>
-    <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">Task: @Dexterous Dessins [2h]
+    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. नया टास्क देने के लिए शुरू में <b>Task:</b> लिखें और समय <b>[15m]</b> या <b>[2h]</b> लगाएं:</p>
+    <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">Task: @Dexterous Dessins [15m]
 1. क्लाइंट को कोटेशन भेजो
 2. साइट की फोटो मंगवाओ</pre>
     <p style="font-size:12px; color:#94a3b8; margin:8px 0 0;">
-      2. बॉट अब उस व्यक्ति को असली हरे रंग के नाम (<b>@Name</b>) से टैग करेगा और हर रिमाइंडर पर भी उन्हें टैग करके नोटिफिकेशन भेजेगा।
+      2. रिमाइंडर रोज़ सुबह <b>9:00 AM से शाम 6:00 PM</b> तक अपने आप जाएंगे और शाम 6 बजे से सुबह 9 बजे तक अपने आप बंद रहेंगे।
     </p>
   </div>
 
@@ -950,11 +1148,11 @@ app.get('/', async (req, res) => {
       <input name="phone" placeholder="WhatsApp Number with 91 (e.g. 919876543210)" required />
       <textarea name="details" rows="3" placeholder="1. Send quotation PDF&#10;2. Check site report" required></textarea>
       <select name="intervalMins">
-        <option value="15">Remind every 15 Minutes (Urgent)</option>
+        <option value="15">Remind every 15 Minutes (Daytime 9AM-6PM)</option>
         <option value="60">Remind every 1 Hour (Daytime 9AM-6PM)</option>
         <option value="120" selected>Remind every 2 Hours (Daytime 9AM-6PM)</option>
         <option value="240">Remind every 4 Hours (Daytime 9AM-6PM)</option>
-        <option value="1440">Remind every 24 Hours (Daily Same Time)</option>
+        <option value="1440">Remind every 24 Hours (Daily 9AM-6PM)</option>
       </select>
       <button type="submit" class="btn">Send on WhatsApp & Start Reminders</button>
     </form>
@@ -964,12 +1162,20 @@ app.get('/', async (req, res) => {
     <h3 style="margin-top:0;">Active Tasks (${activeTasks.length})</h3>
     ${activeTasks.length === 0 ? '<p style="color:#64748b; font-size:14px;">कोई पेंडिंग टास्क नहीं है।</p>' : activeTasks.map(t => `
       <div class="task-row">
-        <div>
+        <div style="flex:1; min-width:200px;">
           <div style="font-weight:700; font-size:14px;">#${t.id}: ${t.title}</div>
           <div style="font-size:12px; color:#94a3b8; margin-top:4px;">Progress: <b>${t.progress}%</b> | Note: ${t.lastNote}</div>
-          <div style="font-size:11px; color:#38bdf8; margin-top:2px;">${formatIntervalLabel(t.intervalMins)} ${t.status === 'pending_approval' ? '• 🔔 Needs Boss Approval' : ''}</div>
+          <div style="font-size:11px; color:#38bdf8; margin-top:3px;">
+            ${formatIntervalLabel(t.intervalMins)} • <span style="color:#fbbf24;">${formatNextDueInfo(t.nextNudgeAt)}</span>
+            • <span style="color:#94a3b8;">Last Sent: ${formatISTTime(t.lastNudgeAt)}</span>
+            ${t.lastSendError ? ` • <span style="color:#f87171;">⚠️ ${t.lastSendError}</span>` : ''}
+            ${t.status === 'pending_approval' ? ' • 🔔 Needs Boss Approval' : ''}
+          </div>
         </div>
-        <div style="display:flex; gap:6px;">
+        <div style="display:flex; gap:6px; align-items:center;">
+          <form method="POST" action="/api/remind/${t.id}" style="margin:0;">
+            <button type="submit" title="Send Reminder Now on WhatsApp" style="background:#f59e0b; color:#0f172a; border:none; padding:8px 10px; border-radius:8px; font-weight:700; cursor:pointer; font-size:12px;">🔔 Remind</button>
+          </form>
           <form method="POST" action="/api/complete/${t.id}" style="margin:0;">
             <button type="submit" style="background:#059669; color:#fff; border:none; padding:8px 10px; border-radius:8px; font-weight:600; cursor:pointer; font-size:12px;">Approve</button>
           </form>
