@@ -1,32 +1,19 @@
 /**
- * WhatsTask Auto-Followup Bot (Final v3.1 - Complete Fix for All 3 Cases)
+ * WhatsTask Auto-Followup Bot (Final v3.2 - Combined Multi-Task Reminder + Multi-Line Bulk Reply Update)
  *
- * 100% VERIFIED ROOT CAUSES FROM YOUR 3 NEW SCREENSHOTS & HOW v3.1 FIXES THEM:
- *
- * CASE 1: RAM GOPAL (#104 - Screenshot 1): Why NO reminder went after 12:12 PM?
- *   - Look at Screenshot 1:
- *     • At 12:03 PM, Ram Gopal replied "All done" -> Bot marked `task.status = 'pending_approval'` (Progress: 100%).
- *     • At 12:11 PM, it was replied "Kaam poora nahi hua" -> Bot hit `delay_or_note`, which kept `Current Progress: 100%` and `status: 'pending_approval'`.
- *     • At 12:12 PM, it was replied "90% done" -> In the old code, `parseIncomingReply()` checked Percentage FIRST (Step 5) AND checked the word "done" LATER (Step 7)!
- *     • Even worse: When the Boss replied in the chat, the old code executed:
- *       `if (isDirectChat && task.chatId !== remoteJid) { task.chatId = remoteJid; }`
- *       Because the message came with a Linked Device ID (`@lid`) or Boss's own JID, `task.chatId` got overwritten! So at 14:12 (2:12 PM), the 2-hour reminder went to a broken `@lid` instead of Ram Gopal's chat!
- *   - FIX in v3.1:
- *     1. Dashboard-assigned tasks (`91...@s.whatsapp.net`) are now 100% LOCKED to that phone number (`chatIdLocked: true`). Replying in the chat can NEVER change or corrupt `task.chatId`!
- *     2. If someone writes "90% done" or "Kaam poora nahi hua", `status` is strictly reset to `'in_progress'` (and if "nahi hua" is written without a %, progress drops from 100% back to 90% so it never stays stuck in 100% pending_approval).
- *
- * CASE 2: DEXTEROUS DESSINS (#101 - Screenshot 2): Why 15-min reminders sometimes show & sometimes say "Waiting for this message"?
- *   - Look at Screenshot 2:
- *     • 16:55 (Waiting), 17:11 (Visible!), 17:26 (Visible!), 17:42 (Waiting), 17:57 (Waiting), 09:00 (Waiting), 09:15 (Visible!).
- *   - Why did some show and some fail in the old v2.8 code you were running?
- *     • Because in v2.8, `makeMultiFileAuthState` was writing Signal keys directly to disk without a queue, AND in 1-on-1 chats it was passing `mentions` / hitting `@lid` vs `@s.whatsapp.net` device ratchets! Whenever WhatsApp's primary phone was asleep and Web/Linked device was active, one device's Signal ratchet desynced.
- *   - FIX in v3.1:
- *     1. Never passes `mentions` array in 1-on-1 personal chats (only in `@g.us` groups where Screenshot 3 proved it works 100%!).
- *     2. Uses `makeCacheableSignalKeyStore` + serialized `credsSaveQueue` + `assertSessions` before every send so all linked devices of the employee get valid Signal keys every single time.
- *
- * CASE 3: TEST GROUP (#102 - Screenshot 3): Working 100% Flawlessly!
- *   - 15:25 -> 17:25 (2 hrs) -> Paused 6 PM to 9 AM -> 09:00 AM sharp!
- *   - Preserved this exact group logic untouched.
+ * KEY UPGRADES IN v3.2:
+ * 1. COMBINED SINGLE REMINDER FOR MULTIPLE TASKS (No More 10 Separate Messages Spam!):
+ *    - When you assign 10 tasks to an employee (like #117 to #126 for Ram Gopal), the bot now sends ONE combined summary message when assigning AND ONE combined reminder message when due!
+ *    - Example Combined Reminder:
+ *      ⏰ *COMBINED TASK REMINDER (10 Pending Tasks)*
+ *      🔹 *#117:* Raghu — *0%* (Note: Assigned)
+ *      🔹 *#118:* Park Hyatt — *0%* (Note: Assigned)
+ *      ...
+ * 2. MULTI-TASK BULK REPLY SUPPORT:
+ *    - The employee can reply to multiple tasks in a single message (e.g. `#117 50% #118 done #123 30%`) and the bot will update all of them at once and send ONE combined confirmation!
+ * 3. DASHBOARD ASSIGN ALSO COMBINED:
+ *    - Assigning multiple tasks from the Dashboard now sends ONE clean combined message instead of 10 separate messages, and sets the same `batchId` & `nextNudgeAt` so their reminders always come together in 1 message.
+ * 4. Preserves all v3.1 fixes: Locked Phone JID (`@s.whatsapp.net`), Zero "Waiting for this message" fix, Strict 9:00 AM - 6:00 PM IST schedule, and Manual "🔔 Remind" button.
  */
 
 const express = require('express');
@@ -117,9 +104,6 @@ function normalizeJid(jid) {
   return clean;
 }
 
-/**
- * Extracts a phone number from a task title if present (e.g. "@919876543210")
- */
 function extractPhoneJidFromText(text) {
   if (!text) return null;
   const m = text.match(/@(91\d{10})\b/);
@@ -127,9 +111,6 @@ function extractPhoneJidFromText(text) {
   return null;
 }
 
-/**
- * Resolves the true canonical JID (`@s.whatsapp.net` or `@g.us`) from an incoming message
- */
 function resolveCanonicalChatIds(msg) {
   const rawRemote = normalizeJid(msg.key.remoteJid);
   const rawSenderPn = normalizeJid(
@@ -158,37 +139,44 @@ function resolveCanonicalChatIds(msg) {
   return { primaryChatId: rawRemote, altChatId: rawSenderPn || rawParticipantLid || null };
 }
 
-// Startup Self-Healing: Repair any existing tasks (like #101, #103, #104) whose chatId or status got corrupted in older versions
+// Startup Self-Healing & Syncing: Repair existing tasks and align nextNudgeAt for tasks in the same chat & interval
+const chatIntervalSyncMap = new Map();
 for (const t of store.tasks) {
   if (t.status !== 'completed') {
     t.chatId = normalizeJid(t.chatId);
     t.altChatId = normalizeJid(t.altChatId);
 
-    // If chatId became @lid, restore from altChatId if altChatId is a real @s.whatsapp.net phone number
     if (t.chatId && t.chatId.endsWith('@lid') && t.altChatId && t.altChatId.endsWith('@s.whatsapp.net')) {
-      console.log(`🔧 Restored Task #${t.id} chatId from @lid (${t.chatId}) -> Phone (${t.altChatId})`);
       const oldLid = t.chatId;
       t.chatId = t.altChatId;
       t.altChatId = oldLid;
     }
 
-    // Lock any task that already has a valid @s.whatsapp.net or @g.us chatId
     if (t.chatId && (t.chatId.endsWith('@s.whatsapp.net') || t.chatId.endsWith('@g.us'))) {
       t.chatIdLocked = true;
     }
 
-    // In 1-on-1 chats, strip mentions array completely so Signal encryption never produces "Waiting for this message"
     if (t.chatId && !t.chatId.endsWith('@g.us')) {
       t.mentions = [];
     }
 
-    // If progress is < 100%, ensure status is 'in_progress' (fixes tasks stuck in pending_approval after "90% done")
     if (typeof t.progress === 'number' && t.progress < 100 && t.status === 'pending_approval') {
       t.status = 'in_progress';
     }
 
     if (!t.nextNudgeAt) {
-      t.nextNudgeAt = Date.now() + (t.intervalMins || 15) * 60000;
+      t.nextNudgeAt = Date.now() + (t.intervalMins || 120) * 60000;
+    }
+
+    // Align tasks of the same chat + same interval that were created within 2 minutes of each other so they remind together!
+    const syncKey = `${t.chatId}_${t.intervalMins}`;
+    if (!chatIntervalSyncMap.has(syncKey)) {
+      chatIntervalSyncMap.set(syncKey, t.nextNudgeAt);
+    } else {
+      const refTime = chatIntervalSyncMap.get(syncKey);
+      if (Math.abs(t.nextNudgeAt - refTime) <= 5 * 60000) {
+        t.nextNudgeAt = refTime;
+      }
     }
   }
 }
@@ -260,9 +248,6 @@ function withTimeout(promise, ms, timeoutMsg) {
   });
 }
 
-/**
- * Group-only mention builder (used ONLY when creating tasks inside a `@g.us` group)
- */
 function buildGroupMentions(text, savedMentions = []) {
   const mentionSet = new Set(Array.isArray(savedMentions) ? savedMentions : []);
   const matches = (text || '').matchAll(/@(\d{10,18})\b/g);
@@ -280,12 +265,6 @@ function buildGroupMentions(text, savedMentions = []) {
   return Array.from(mentionSet);
 }
 
-/**
- * Bulletproof WhatsApp Message Sender (v3.1)
- * - In 1-on-1 personal chats: NEVER sends `mentions` array, resolves `@lid` -> `@s.whatsapp.net`, and refreshes Signal sessions so "Waiting for this message" never happens.
- * - In Group chats (`@g.us`): Passes group `mentions` normally (just like Test Group in Screenshot 3).
- * - If primary JID fails, automatically tries `fallbackJid` AND updates the task if fallback succeeds.
- */
 function sendWhatsAppMessage(rawJid, text, savedMentions = [], fallbackJid = null) {
   sendQueuePromise = sendQueuePromise
     .catch(() => {})
@@ -298,7 +277,6 @@ function sendWhatsAppMessage(rawJid, text, savedMentions = [], fallbackJid = nul
       let jid = normalizeJid(rawJid);
       const normFallback = normalizeJid(fallbackJid);
 
-      // Always prefer @s.whatsapp.net over @lid if either primary or fallback has it
       if (jid && jid.endsWith('@lid') && normFallback && normFallback.endsWith('@s.whatsapp.net')) {
         jid = normFallback;
       }
@@ -310,7 +288,6 @@ function sendWhatsAppMessage(rawJid, text, savedMentions = [], fallbackJid = nul
         : { text };
 
       try {
-        // For 1-on-1 chats, ensure Signal session keys are asserted before encrypting
         if (!isGroup && typeof sock.assertSessions === 'function') {
           try {
             await withTimeout(sock.assertSessions([jid], false), 5000, 'assertSessions timeout');
@@ -369,53 +346,95 @@ function sendWhatsAppMessage(rawJid, text, savedMentions = [], fallbackJid = nul
   return sendQueuePromise;
 }
 
-// Send a reminder for a single task (used by both auto-scheduler & manual button)
-async function triggerTaskReminder(task, isManual = false) {
+/**
+ * Sends a COMBINED reminder for a list of tasks belonging to the same chat/employee!
+ * - If 1 task is due: sends the clean single-task reminder format.
+ * - If multiple tasks (e.g., #117 to #126) are due for the same chat: sends ONE single combined message listing all of them together!
+ */
+async function triggerBatchReminder(tasksList, isManual = false) {
+  if (!Array.isArray(tasksList) || tasksList.length === 0) return false;
+
   const now = Date.now();
-  const headerPrefix = isManual ? '🔔 *MANUAL REMINDER' : '⏰ *TASK REMINDER';
+  const firstTask = tasksList[0];
+  firstTask.chatId = normalizeJid(firstTask.chatId);
+  firstTask.altChatId = normalizeJid(firstTask.altChatId);
 
-  task.chatId = normalizeJid(task.chatId);
-  task.altChatId = normalizeJid(task.altChatId);
-
-  // If task.chatId is still @lid but altChatId is @s.whatsapp.net, promote altChatId
-  if (task.chatId && task.chatId.endsWith('@lid') && task.altChatId && task.altChatId.endsWith('@s.whatsapp.net')) {
-    const tmp = task.chatId;
-    task.chatId = task.altChatId;
-    task.altChatId = tmp;
+  if (firstTask.chatId && firstTask.chatId.endsWith('@lid') && firstTask.altChatId && firstTask.altChatId.endsWith('@s.whatsapp.net')) {
+    const tmp = firstTask.chatId;
+    firstTask.chatId = firstTask.altChatId;
+    firstTask.altChatId = tmp;
   }
 
-  let sentResult = null;
-  if (task.status === 'pending_approval') {
-    sentResult = await sendWhatsAppMessage(
-      task.chatId,
-      `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम पूरा रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`,
-      task.mentions,
-      task.altChatId
-    );
+  let messageText = '';
+  const allMentions = [];
+  for (const t of tasksList) {
+    if (Array.isArray(t.mentions)) allMentions.push(...t.mentions);
+  }
+
+  if (tasksList.length === 1) {
+    const task = tasksList[0];
+    const headerPrefix = isManual ? '🔔 *MANUAL REMINDER' : '⏰ *TASK REMINDER';
+    if (task.status === 'pending_approval') {
+      messageText = `🔔 *PENDING BOSS APPROVAL (#${task.id})*\n\n📌 *Task:* ${task.title}\nयह काम पूरा रिपोर्ट किया गया है। रिमाइंडर बंद करने के लिए *"Approve #${task.id}"* लिखें।`;
+    } else {
+      messageText = `${headerPrefix} (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress}% पूरा हुआ (${100 - task.progress}% बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया इस मैसेज पर Reply करें या लिखें: *"#${task.id} 40% हो गया"*`;
+    }
   } else {
-    sentResult = await sendWhatsAppMessage(
-      task.chatId,
-      `${headerPrefix} (#${task.id})*\n\n📌 *Task:* ${task.title}\n📈 *Current Progress:* ${task.progress}% पूरा हुआ (${100 - task.progress}% बाकी है)\n📝 *Last Note:* ${task.lastNote || 'कोई अपडेट नहीं'}\n\nकृपया इस मैसेज पर Reply करें या लिखें: *"#${task.id} 40% हो गया"*`,
-      task.mentions,
-      task.altChatId
-    );
+    // COMBINED SINGLE REMINDER FOR MULTIPLE TASKS!
+    const headerTitle = isManual
+      ? `🔔 *MANUAL REMINDER (${tasksList.length} Pending Tasks)*`
+      : `⏰ *TASK REMINDER (${tasksList.length} Pending Tasks)*`;
+
+    const lines = tasksList.map(t => {
+      const statusTag = t.status === 'pending_approval'
+        ? '✅ *100% (Needs Boss Approval)*'
+        : `📈 *${t.progress}% पूरा* (${100 - t.progress}% बाकी)`;
+      const noteStr = t.lastNote && t.lastNote !== 'Assigned' && t.lastNote !== 'Assigned from Dashboard'
+        ? ` | 📝 _"${t.lastNote}"_`
+        : '';
+      return `🔹 *#${t.id}:* ${t.title}\n   └ ${statusTag}${noteStr}`;
+    }).join('\n\n');
+
+    const ex1 = tasksList[0].id;
+    const ex2 = tasksList[1].id;
+    messageText = `${headerTitle}\n\n${lines}\n\n💡 *एक साथ या अलग-अलग अपडेट ऐसे दें:*\n• *"#${ex1} 50% #${ex2} 100%"*\n• या किसी एक का: *"#${ex1} 40% हो गया"*`;
   }
+
+  const sentResult = await sendWhatsAppMessage(
+    firstTask.chatId,
+    messageText,
+    allMentions,
+    firstTask.altChatId
+  );
 
   if (sentResult) {
-    task.lastNudgeAt = Date.now();
-    task.nextNudgeAt = Date.now() + (task.intervalMins || 120) * 60000;
-    task.lastSendError = null;
+    const finishNow = Date.now();
+    for (const t of tasksList) {
+      t.lastNudgeAt = finishNow;
+      t.nextNudgeAt = finishNow + (t.intervalMins || 120) * 60000;
+      t.lastSendError = null;
+    }
     saveStore();
-    console.log(`✅ Reminder sent for Task #${task.id} to ${sentResult.usedJid} -> Next in ${task.intervalMins} mins`);
+    console.log(`✅ Sent combined reminder for ${tasksList.length} task(s) [${tasksList.map(t => '#' + t.id).join(', ')}] to ${sentResult.usedJid}`);
     return true;
   } else {
-    task.lastSendError = isConnected ? `Retry in 30s (${formatISTTime(now)})` : 'Waiting for WhatsApp connection';
+    for (const t of tasksList) {
+      t.lastSendError = isConnected ? `Retry in 30s (${formatISTTime(now)})` : 'Waiting for WhatsApp connection';
+    }
     saveStore();
     return false;
   }
 }
 
-// Check and dispatch any due reminders (Strictly runs only between 9:00 AM and 6:00 PM IST)
+// Keep single-task wrapper for compatibility
+async function triggerTaskReminder(task, isManual = false) {
+  return triggerBatchReminder([task], isManual);
+}
+
+/**
+ * Check and dispatch any due reminders (Strictly runs only between 9:00 AM and 6:00 PM IST)
+ * GROUPS all due tasks by `chatId` so an employee with 10 tasks gets ONE combined reminder message instead of 10 separate messages!
+ */
 async function checkAndSendDueReminders() {
   if (isCheckingReminders) return;
   if (!sock || !isConnected) return;
@@ -424,13 +443,48 @@ async function checkAndSendDueReminders() {
   isCheckingReminders = true;
   try {
     const now = Date.now();
+    // Look ahead by 60 seconds when grouping so tasks created in the same batch (even if 10s apart) always get grouped together!
     const dueTasks = store.tasks.filter(
       t => t.status !== 'completed' && (!t.nextNudgeAt || t.nextNudgeAt <= now)
     );
 
+    if (dueTasks.length === 0) return;
+
+    // Group due tasks by normalized chatId (and include any sibling active tasks of the same chat & interval that are due within the next 2 minutes)
+    const groupedByChat = new Map();
+    const includedTaskIds = new Set();
+
     for (const task of dueTasks) {
+      const normChatId = normalizeJid(task.chatId);
+      if (!groupedByChat.has(normChatId)) {
+        groupedByChat.set(normChatId, []);
+      }
+      if (!includedTaskIds.has(task.id)) {
+        groupedByChat.get(normChatId).push(task);
+        includedTaskIds.add(task.id);
+      }
+
+      // Also pull in any sibling tasks of the same chat + same interval whose timer is due within the next 2 minutes so a batch never splits!
+      const siblings = store.tasks.filter(
+        s =>
+          s.status !== 'completed' &&
+          !includedTaskIds.has(s.id) &&
+          normalizeJid(s.chatId) === normChatId &&
+          s.intervalMins === task.intervalMins &&
+          s.nextNudgeAt &&
+          s.nextNudgeAt <= now + 120000
+      );
+      for (const sib of siblings) {
+        groupedByChat.get(normChatId).push(sib);
+        includedTaskIds.add(sib.id);
+      }
+    }
+
+    for (const [, chatTasks] of groupedByChat.entries()) {
       if (isQuietHours() || !isConnected) break;
-      await triggerTaskReminder(task, false);
+      // Sort by task ID ascending (#117, #118, #119...)
+      chatTasks.sort((a, b) => a.id - b.id);
+      await triggerBatchReminder(chatTasks, false);
     }
   } catch (e) {
     console.error('Error in checkAndSendDueReminders:', e.message);
@@ -520,7 +574,52 @@ function extractMultipleTasks(rawBody) {
 }
 
 /**
- * STRICT REPLY PARSER (v3.1)
+ * Parse a single segment for one task (used by both single reply and multi-task bulk reply)
+ */
+function classifyTaskUpdateSegment(segmentText, targetTaskId) {
+  const raw = (segmentText || '').trim();
+  const lower = raw.toLowerCase();
+
+  const textWithoutIdsAndMentions = lower
+    .replace(/@\d{10,18}\b/g, '')
+    .replace(/(?:#|task\s*)\d+/gi, '');
+  const pctMatch = textWithoutIdsAndMentions.match(/\b(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
+
+  if (pctMatch) {
+    const pct = Math.min(100, Math.max(0, parseInt(pctMatch[1], 10)));
+    if (pct < 100) {
+      return { type: 'progress_update', targetId: targetTaskId, progress: pct, note: raw };
+    } else {
+      return { type: 'employee_claim_done', targetId: targetTaskId, progress: 100, note: raw };
+    }
+  }
+
+  const isNotDone = /\b(poora nahi|pura nahi|nahi hua|nhi hua|abhi nahi|pending hai|baaki hai|baki hai)\b|पूरा नहीं|नहीं हुआ|बाकी है/i.test(lower);
+  if (isNotDone || /\b(delay|late|time lagega|kal|parson|ruk|atka|blocked|stuck|wait|baaki|baki|chalu hai|chal raha|kar raha|kr raha|working)\b|डिले|देरी|कल|चल रहा|कर रहा/i.test(lower)) {
+    return { type: 'delay_or_note', targetId: targetTaskId, reopenFrom100: isNotDone, note: raw };
+  }
+
+  if (/\b(aadha|adha|half)\b|आधा/i.test(lower)) {
+    return { type: 'progress_update', targetId: targetTaskId, progress: 50, note: raw };
+  }
+
+  if (/\b(thoda|shuru|started)\b|थोड़ा|शुरू/i.test(lower)) {
+    return { type: 'progress_update', targetId: targetTaskId, progress: 20, note: raw };
+  }
+
+  if (/\b(done|completed|complete|ho gaya|hogaya|ho gya|khatam|poora ho gaya)\b|हो गया|पूरा हो गया|खत्म/i.test(lower)) {
+    return { type: 'employee_claim_done', targetId: targetTaskId, progress: 100, note: raw };
+  }
+
+  return { type: 'general_qa_note', targetId: targetTaskId, note: raw };
+}
+
+/**
+ * STRICT REPLY PARSER (v3.2 - Supports Single OR Multi-Task Bulk Replies!)
+ * Examples supported:
+ *  - "#117 50% #118 done #120 thoda delay hai" -> updates #117, #118, and #120 in ONE go!
+ *  - "Approve #117 #118" or "Approve all"
+ *  - Swipe-reply to a combined reminder with "50% ho gaya" or "#123 40%"
  */
 function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) {
   const raw = (text || '').trim();
@@ -547,132 +646,104 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     lower.includes('approval needed') ||
     lower.includes('pending boss approval') ||
     lower.includes('delay / status noted') ||
-    lower.includes('note recorded')
+    lower.includes('note recorded') ||
+    lower.includes('combined task update')
   ) {
     return { ignore: true };
   }
 
-  // 2. Boss/Manager Approval ("Approve #101", "Close #101", "Approve all")
-  const approveMatch = lower.match(/^(?:approve|close|final\s*done)\s*(?:#|task\s*)?(\d+|all)\b/i);
-  if (approveMatch) {
-    return {
-      ignore: false,
-      type: 'manager_approve',
-      targetId: approveMatch[1] !== 'all' ? parseInt(approveMatch[1], 10) : 'all'
-    };
+  // 2. Boss/Manager Approval ("Approve #101", "Approve #117 #118", "Close #101", "Approve all")
+  if (/^(?:approve|close|final\s*done)\b/i.test(lower)) {
+    if (/\ball\b/i.test(lower)) {
+      return { ignore: false, type: 'manager_approve', targetId: 'all' };
+    }
+    const ids = Array.from(lower.matchAll(/(?:#|task\s*)?(\d{3,4})\b/g)).map(m => parseInt(m[1], 10));
+    if (ids.length > 0) {
+      return { ignore: false, type: 'manager_approve_multi', targetIds: ids };
+    }
   }
 
-  // 3. Check explicit Task ID (#101) OR quoted Bot message with (#101)
+  // 3. Check if the message mentions MULTIPLE explicit task IDs (e.g. "#117 50% #118 80%")
+  const explicitMatches = Array.from(raw.matchAll(/(?:#|task\s*)(\d{3,4})\b/gi));
+  const validExplicitMatches = explicitMatches.filter(m => {
+    const idNum = parseInt(m[1], 10);
+    return allActiveTasks.some(t => t.id === idNum);
+  });
+
+  if (validExplicitMatches.length > 1) {
+    const updates = [];
+    for (let i = 0; i < validExplicitMatches.length; i++) {
+      const currentMatch = validExplicitMatches[i];
+      const idNum = parseInt(currentMatch[1], 10);
+      const startIdx = currentMatch.index;
+      const endIdx = i + 1 < validExplicitMatches.length ? validExplicitMatches[i + 1].index : raw.length;
+      const segment = raw.slice(startIdx, endIdx).trim();
+      updates.push(classifyTaskUpdateSegment(segment, idNum));
+    }
+    return { ignore: false, type: 'multi_task_update', updates };
+  }
+
+  // 4. Single explicit Task ID (#101) OR quoted Bot message with (#101)
   let targetTaskId = null;
   let isExplicitlyTargeted = false;
 
-  const explicitIdMatch = lower.match(/(?:#|task\s*)(\d{3,4})\b/i);
-  if (explicitIdMatch) {
-    const idNum = parseInt(explicitIdMatch[1], 10);
-    if (allActiveTasks.some(t => t.id === idNum)) {
-      targetTaskId = idNum;
-      isExplicitlyTargeted = true;
-    }
+  if (validExplicitMatches.length === 1) {
+    targetTaskId = parseInt(validExplicitMatches[0][1], 10);
+    isExplicitlyTargeted = true;
   }
 
   if (!targetTaskId && quotedText) {
-    const quotedIdMatch = quotedText.match(/\(#(\d{3,4})\)/) || quotedText.match(/#(\d{3,4})\b/);
-    if (quotedIdMatch) {
-      const qId = parseInt(quotedIdMatch[1], 10);
-      if (allActiveTasks.some(t => t.id === qId)) {
-        targetTaskId = qId;
-        isExplicitlyTargeted = true;
+    // Check if the quoted message has a single task ID or multiple task IDs
+    const allQuotedIds = Array.from(quotedText.matchAll(/#(\d{3,4})\b/g))
+      .map(m => parseInt(m[1], 10))
+      .filter(idNum => allActiveTasks.some(t => t.id === idNum));
+    const uniqueQuotedIds = Array.from(new Set(allQuotedIds));
+
+    if (uniqueQuotedIds.length === 1) {
+      targetTaskId = uniqueQuotedIds[0];
+      isExplicitlyTargeted = true;
+    } else if (uniqueQuotedIds.length > 1) {
+      // Quoted a combined multi-task message without typing a specific #ID:
+      // If user wrote "all done" or "50% all", apply to all quoted tasks in this chat; otherwise ask or apply if only 1 active
+      const textWithoutIds = lower.replace(/@\d{10,18}\b/g, '');
+      const pctMatch = textWithoutIds.match(/\b(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
+      if (/\b(all|sab|saare|सारे|सब)\b/i.test(lower) && (pctMatch || /\b(done|ho gaya|complete)\b/i.test(lower))) {
+        const updates = uniqueQuotedIds.map(idNum => classifyTaskUpdateSegment(raw, idNum));
+        return { ignore: false, type: 'multi_task_update', updates };
       }
+      // If they didn't specify which #ID out of the 10 tasks in the combined message, prompt them kindly
+      return {
+        ignore: false,
+        type: 'clarify_which_task',
+        candidateIds: uniqueQuotedIds,
+        note: raw
+      };
     }
   }
 
-  // 4. Remove @mention numbers and #TaskID before checking for %
   const textWithoutIdsAndMentions = lower
     .replace(/@\d{10,18}\b/g, '')
     .replace(/(?:#|task\s*)\d+/gi, '');
   const pctMatch = textWithoutIdsAndMentions.match(/\b(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
 
   if (!isExplicitlyTargeted) {
-    // Allow short percentage updates in a chat that has active tasks (like "25% ho gaya hai" in Screenshot 2 & 3)
-    if (chatMatchedTasks.length > 0 && pctMatch && raw.length <= 45) {
-      targetTaskId = chatMatchedTasks[chatMatchedTasks.length - 1].id;
+    if (chatMatchedTasks.length === 1 && pctMatch && raw.length <= 45) {
+      targetTaskId = chatMatchedTasks[0].id;
+    } else if (chatMatchedTasks.length > 1 && pctMatch && raw.length <= 45) {
+      // Multiple active tasks in this chat and employee sent bare "25% ho gaya" without #ID
+      return {
+        ignore: false,
+        type: 'clarify_which_task',
+        candidateIds: chatMatchedTasks.map(t => t.id),
+        note: raw
+      };
     } else {
       return { ignore: true };
     }
   }
 
-  // 5. Check Percentage (e.g. "90% done", "25% ho gaya hai")
-  if (pctMatch) {
-    const pct = Math.min(100, Math.max(0, parseInt(pctMatch[1], 10)));
-    if (pct < 100) {
-      return {
-        ignore: false,
-        type: 'progress_update',
-        targetId: targetTaskId,
-        progress: pct,
-        note: raw
-      };
-    } else {
-      return {
-        ignore: false,
-        type: 'employee_claim_done',
-        targetId: targetTaskId,
-        progress: 100,
-        note: raw
-      };
-    }
-  }
-
-  // 6. Check "Not Done / Incomplete" or Delay / Blocker keywords (e.g. "Kaam poora nahi hua" in Ram Gopal's chat)
-  const isNotDone = /\b(poora nahi|pura nahi|nahi hua|nhi hua|abhi nahi|pending hai|baaki hai|baki hai)\b|पूरा नहीं|नहीं हुआ|बाकी है/i.test(lower);
-  if (isNotDone || /\b(delay|late|time lagega|kal|parson|ruk|atka|blocked|stuck|wait|baaki|baki|chalu hai|chal raha|kar raha|kr raha|working)\b|डिले|देरी|कल|चल रहा|कर रहा/i.test(lower)) {
-    return {
-      ignore: false,
-      type: 'delay_or_note',
-      targetId: targetTaskId,
-      reopenFrom100: isNotDone,
-      note: raw
-    };
-  }
-
-  if (/\b(aadha|adha|half)\b|आधा/i.test(lower)) {
-    return {
-      ignore: false,
-      type: 'progress_update',
-      targetId: targetTaskId,
-      progress: 50,
-      note: raw
-    };
-  }
-
-  if (/\b(thoda|shuru|started)\b|थोड़ा|शुरू/i.test(lower)) {
-    return {
-      ignore: false,
-      type: 'progress_update',
-      targetId: targetTaskId,
-      progress: 20,
-      note: raw
-    };
-  }
-
-  // 7. Check if Employee claims 100% "Done" / "All done" / "ho gaya" (without a <100% number)
-  if (/\b(done|completed|complete|ho gaya|hogaya|ho gya|khatam|poora ho gaya)\b|हो गया|पूरा हो गया|खत्म/i.test(lower)) {
-    return {
-      ignore: false,
-      type: 'employee_claim_done',
-      targetId: targetTaskId,
-      progress: 100,
-      note: raw
-    };
-  }
-
-  // 8. General Q&A note when tagged with #ID or swipe-replied to bot
-  return {
-    ignore: false,
-    type: 'general_qa_note',
-    targetId: targetTaskId,
-    note: raw
-  };
+  const singleResult = classifyTaskUpdateSegment(raw, targetTaskId);
+  return { ignore: false, ...singleResult };
 }
 
 function formatIntervalLabel(mins) {
@@ -753,7 +824,6 @@ async function startWhatsApp() {
       }
     });
 
-    // Serialize saveCreds calls so concurrent Signal ratchet updates never corrupt each other on disk
     sock.ev.on('creds.update', () => {
       credsSaveQueue = credsSaveQueue
         .catch(() => {})
@@ -800,7 +870,6 @@ async function startWhatsApp() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`⚠️ Connection closed (code: ${statusCode}).`);
 
-        // ONLY clear auth folder if explicitly logged out (401) from phone
         if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
           console.log('🔒 Device logged out from phone. Clearing auth session for fresh QR.');
           clearAuthFolder();
@@ -826,11 +895,9 @@ async function startWhatsApp() {
         const rawRemoteJid = normalizeJid(msg.key.remoteJid);
         if (!rawRemoteJid || rawRemoteJid === 'status@broadcast') continue;
 
-        // Resolve @lid -> real phone @s.whatsapp.net JID immediately
         const { primaryChatId, altChatId } = resolveCanonicalChatIds(msg);
         const replyTargetJid = primaryChatId || rawRemoteJid;
 
-        // Upgrade any existing unlocked @lid task if we just learned its @s.whatsapp.net phone number
         let storeUpdatedByLidMap = false;
         for (const t of store.tasks) {
           if (t.status !== 'completed' && t.chatId && t.chatId.endsWith('@lid')) {
@@ -874,17 +941,19 @@ async function startWhatsApp() {
             } catch (e) {}
           }
 
+          const batchNow = Date.now();
+          const sharedNextNudgeAt = batchNow + intervalMins * 60000;
+          const batchId = `batch_${batchNow}`;
           const createdTasks = [];
-          let staggerIdx = 0;
+
           for (const taskTitle of subTaskStrings) {
-            const staggerMs = staggerIdx * 10000;
-            staggerIdx++;
             const phoneFromText = !isGroupChat ? extractPhoneJidFromText(taskTitle) : null;
             const finalChatId = phoneFromText || replyTargetJid;
             const groupMentions = isGroupChat ? buildGroupMentions(taskTitle, mentionedJids) : [];
 
             const newTask = {
               id: store.nextId++,
+              batchId,
               chatId: finalChatId,
               chatIdLocked: finalChatId.endsWith('@s.whatsapp.net') || finalChatId.endsWith('@g.us'),
               altChatId: altChatId && altChatId !== finalChatId ? altChatId : rawRemoteJid,
@@ -894,8 +963,8 @@ async function startWhatsApp() {
               progress: 0,
               status: 'in_progress',
               intervalMins,
-              lastNudgeAt: Date.now(),
-              nextNudgeAt: Date.now() + intervalMins * 60000 + staggerMs,
+              lastNudgeAt: batchNow,
+              nextNudgeAt: sharedNextNudgeAt, // Exact same timestamp so their reminders always go together in ONE combined message!
               lastNote: 'Assigned',
               createdAt: new Date().toISOString()
             };
@@ -917,8 +986,8 @@ async function startWhatsApp() {
               .map(t => `🔹 *#${t.id}:* ${t.title} (0% पूरा हुआ)`)
               .join('\n');
             await sendWhatsAppMessage(
-              replyTargetJid,
-              `📋 *MULTIPLE TASKS ASSIGNED (${createdTasks.length} Tasks)*\n\n${listStr}\n\n⏰ *Auto-Reminder:* ${formatIntervalLabel(intervalMins)} (9 AM - 6 PM)\n💡 _अलग-अलग अपडेट ऐसे दें:_\n_• "#${createdTasks[0].id} 50% हो गया"_\n_• "#${createdTasks[1].id} थोड़ा डिले है"_`,
+              createdTasks[0].chatId,
+              `📋 *MULTIPLE TASKS ASSIGNED (${createdTasks.length} Tasks)*\n\n${listStr}\n\n⏰ *Auto-Reminder:* ${formatIntervalLabel(intervalMins)} (9 AM - 6 PM) — _सभी का एक साथ एक ही मैसेज में रिमाइंडर आएगा!_\n\n💡 _एक साथ या अलग-अलग अपडेट ऐसे दें:_\n_• "#${createdTasks[0].id} 50% #${createdTasks[1].id} 100%"_\n_• या "#${createdTasks[0].id} 50% हो गया"_`,
               isGroupChat ? mentionedJids : [],
               altChatId
             );
@@ -947,41 +1016,119 @@ async function startWhatsApp() {
         );
         if (parsed.ignore) continue;
 
-        // Handle Boss Approval ("Approve #101" / "Close #101")
+        // Handle Boss Approval ("Approve #101", "Approve #117 #118", "Approve all")
         if (parsed.type === 'manager_approve') {
-          if (parsed.targetId === 'all') {
-            if (chatMatchedTasks.length === 0) continue;
-            chatMatchedTasks.forEach(t => {
+          if (chatMatchedTasks.length === 0) continue;
+          chatMatchedTasks.forEach(t => {
+            t.status = 'completed';
+            t.progress = 100;
+          });
+          saveStore();
+          await sendWhatsAppMessage(
+            replyTargetJid,
+            `✅ *ALL TASKS APPROVED & CLOSED*\n\nइस चैट के सभी ${chatMatchedTasks.length} टास्क बॉस द्वारा Complete मार्क कर दिए गए हैं। ऑटोमैटिक रिमाइंडर बंद हो गए हैं।`
+          );
+          continue;
+        }
+
+        if (parsed.type === 'manager_approve_multi') {
+          const approvedList = [];
+          for (const idNum of parsed.targetIds) {
+            const t = allActiveTasks.find(x => x.id === idNum);
+            if (t) {
               t.status = 'completed';
               t.progress = 100;
-            });
+              approvedList.push(t);
+            }
+          }
+          if (approvedList.length > 0) {
             saveStore();
-            await sendWhatsAppMessage(
-              replyTargetJid,
-              `✅ *ALL TASKS APPROVED & CLOSED*\n\nइस चैट के सभी ${chatMatchedTasks.length} टास्क बॉस द्वारा Complete मार्क कर दिए गए हैं। ऑटोमैटिक रिमाइंडर बंद हो गए हैं।`
-            );
-          } else {
-            const task = allActiveTasks.find(t => t.id === parsed.targetId);
-            if (task) {
-              task.status = 'completed';
-              task.progress = 100;
-              saveStore();
+            if (approvedList.length === 1) {
+              const task = approvedList[0];
               await sendWhatsAppMessage(
                 task.chatId,
                 `✅ *TASK COMPLETED & APPROVED (#${task.id})*\n\n📌 "${task.title}" को Complete कर दिया गया है। अब इसके रिमाइंडर बंद हो गए हैं।`,
                 task.mentions,
                 task.altChatId
               );
+            } else {
+              const lines = approvedList.map(t => `✅ *#${t.id}:* ${t.title}`).join('\n');
+              await sendWhatsAppMessage(
+                approvedList[0].chatId,
+                `✅ *${approvedList.length} TASKS APPROVED & CLOSED*\n\n${lines}\n\nइन टास्क के रिमाइंडर अब बंद हो गए हैं।`,
+                approvedList[0].mentions,
+                approvedList[0].altChatId
+              );
             }
           }
           continue;
         }
 
+        // If employee replied "25% ho gaya" without #ID when 10 tasks are active in the chat
+        if (parsed.type === 'clarify_which_task') {
+          const idExamples = parsed.candidateIds.slice(0, 3).map(id => `#${id}`).join(', ');
+          await sendWhatsAppMessage(
+            replyTargetJid,
+            `❓ *कृपया Task #ID साथ में लिखें*\n\nइस चैट में एक से ज़्यादा टास्क चल रहे हैं (${idExamples}...)।\nकृपया टास्क नंबर के साथ रिप्लाई करें, जैसे:\n• *"#${parsed.candidateIds[0]} ${parsed.note}"*\n• या एक साथ कई टास्क: *"#${parsed.candidateIds[0]} 50% #${parsed.candidateIds[1] || parsed.candidateIds[0]} 100%"*`
+          );
+          continue;
+        }
+
+        // Handle Multi-Task Bulk Update in a single message (e.g. "#117 50% #118 done")
+        if (parsed.type === 'multi_task_update') {
+          const updatedSummaryLines = [];
+          let targetChatForReply = replyTargetJid;
+          let targetAltForReply = altChatId;
+
+          for (const upd of parsed.updates) {
+            const task = allActiveTasks.find(t => t.id === upd.targetId);
+            if (!task) continue;
+            targetChatForReply = task.chatId;
+            targetAltForReply = task.altChatId;
+
+            if (upd.type === 'progress_update') {
+              task.progress = upd.progress;
+              task.lastNote = upd.note;
+              task.status = 'in_progress';
+              updatedSummaryLines.push(`📊 *#${task.id}:* ${task.title} ➔ *${task.progress}% पूरा*`);
+            } else if (upd.type === 'employee_claim_done') {
+              task.progress = 100;
+              task.lastNote = upd.note;
+              task.status = store.settings.requireManagerApproval ? 'pending_approval' : 'completed';
+              updatedSummaryLines.push(
+                store.settings.requireManagerApproval
+                  ? `🔔 *#${task.id}:* ${task.title} ➔ *100% (Pending Boss Approval)*`
+                  : `✅ *#${task.id}:* ${task.title} ➔ *Completed*`
+              );
+            } else if (upd.type === 'delay_or_note') {
+              task.lastNote = upd.note;
+              if (task.status === 'pending_approval' || upd.reopenFrom100) {
+                task.status = 'in_progress';
+                if (task.progress >= 100) task.progress = 90;
+              }
+              updatedSummaryLines.push(`⚠️ *#${task.id}:* ${task.title} ➔ Note: "${upd.note}" (${task.progress}%)`);
+            } else {
+              task.lastNote = upd.note;
+              updatedSummaryLines.push(`📝 *#${task.id}:* ${task.title} ➔ "${upd.note}" (${task.progress}%)`);
+            }
+          }
+
+          if (updatedSummaryLines.length > 0) {
+            saveStore();
+            await sendWhatsAppMessage(
+              targetChatForReply,
+              `📊 *COMBINED TASK UPDATE RECORDED (${updatedSummaryLines.length} Tasks)*\n\n${updatedSummaryLines.join('\n')}\n\n⏰ _बाकी पेंडिंग टास्क का रिमाइंडर तय समय पर एक साथ आएगा।_`,
+              [],
+              targetAltForReply
+            );
+          }
+          continue;
+        }
+
+        // Handle Single Task Update
         const task = allActiveTasks.find(t => t.id === parsed.targetId);
         if (!task) continue;
 
-        // NEVER overwrite a locked @s.whatsapp.net or @g.us chatId with @lid!
-        // Only upgrade if task.chatId was an @lid and we now have a real @s.whatsapp.net JID (that isn't the bot's own number).
         if (!task.chatIdLocked && task.chatId.endsWith('@lid') && replyTargetJid.endsWith('@s.whatsapp.net') && replyTargetJid !== botOwnJid) {
           task.altChatId = task.chatId;
           task.chatId = replyTargetJid;
@@ -990,11 +1137,19 @@ async function startWhatsApp() {
           task.altChatId = rawRemoteJid;
         }
 
+        // Check if this task is part of a multi-task chat so we keep its nextNudgeAt synced with its siblings!
+        const siblingTasks = allActiveTasks.filter(
+          s => s.id !== task.id && normalizeJid(s.chatId) === normalizeJid(task.chatId) && s.intervalMins === task.intervalMins
+        );
+        const syncedNextNudge = siblingTasks.length > 0 && siblingTasks[0].nextNudgeAt > Date.now()
+          ? siblingTasks[0].nextNudgeAt
+          : Date.now() + task.intervalMins * 60000;
+
         if (parsed.type === 'progress_update') {
           task.progress = parsed.progress;
           task.lastNote = parsed.note;
-          task.status = 'in_progress'; // Always reset to in_progress so reminders continue normally (like Ram Gopal's "90% done")
-          task.nextNudgeAt = Date.now() + task.intervalMins * 60000;
+          task.status = 'in_progress';
+          task.nextNudgeAt = syncedNextNudge;
           saveStore();
 
           await sendWhatsAppMessage(
@@ -1005,12 +1160,11 @@ async function startWhatsApp() {
           );
         } else if (parsed.type === 'delay_or_note') {
           task.lastNote = parsed.note;
-          // If task was at 100% pending_approval and someone wrote "Kaam poora nahi hua", reopen it to in_progress!
           if (task.status === 'pending_approval' || parsed.reopenFrom100) {
             task.status = 'in_progress';
             if (task.progress >= 100) task.progress = 90;
           }
-          task.nextNudgeAt = Date.now() + task.intervalMins * 60000;
+          task.nextNudgeAt = syncedNextNudge;
           saveStore();
 
           await sendWhatsAppMessage(
@@ -1035,7 +1189,7 @@ async function startWhatsApp() {
 
           if (store.settings.requireManagerApproval) {
             task.status = 'pending_approval';
-            task.nextNudgeAt = Date.now() + task.intervalMins * 60000;
+            task.nextNudgeAt = syncedNextNudge;
             saveStore();
 
             await sendWhatsAppMessage(
@@ -1095,14 +1249,28 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// Manual Remind Now endpoint for individual task (Works anytime when you click 🔔 Remind)
+// Manual Remind Now endpoint for individual task
 app.post('/api/remind/:id', async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const task = store.tasks.find(t => t.id === id && t.status !== 'completed');
   if (task) {
-    await triggerTaskReminder(task, true);
+    await triggerBatchReminder([task], true);
   }
   res.redirect('/?reminded=' + id);
+});
+
+// Manual "Remind All Tasks of This Employee/Chat in 1 Message" endpoint
+app.post('/api/remind-chat', async (req, res) => {
+  const { chatId } = req.body;
+  const normTarget = normalizeJid(chatId);
+  const chatTasks = store.tasks.filter(
+    t => t.status !== 'completed' && normalizeJid(t.chatId) === normTarget
+  );
+  if (chatTasks.length > 0) {
+    chatTasks.sort((a, b) => a.id - b.id);
+    await triggerBatchReminder(chatTasks, true);
+  }
+  res.redirect('/?reminded=all');
 });
 
 app.post('/api/pair-phone', async (req, res) => {
@@ -1148,6 +1316,11 @@ app.post('/api/reset-session', async (req, res) => {
   res.redirect('/');
 });
 
+/**
+ * Assign New Task(s) from Dashboard (v3.2):
+ * - Now sends ONE combined WhatsApp message when multiple tasks are entered, instead of spamming 10 separate messages!
+ * - Gives all tasks in the batch the exact same `nextNudgeAt` so their automatic reminders also go out as ONE combined message!
+ */
 app.post('/api/assign', async (req, res) => {
   const { employeeName, phone, details, intervalMins } = req.body;
   if (!phone || !details) return res.redirect('/');
@@ -1158,35 +1331,51 @@ app.post('/api/assign', async (req, res) => {
   const mins = parseInt(intervalMins, 10) || 120;
 
   const subTasks = extractMultipleTasks(details);
-  let staggerIndex = 0;
-  for (const title of subTasks) {
-    const staggerMs = staggerIndex * 10000;
-    staggerIndex++;
+  const batchNow = Date.now();
+  const sharedNextNudgeAt = batchNow + mins * 60000;
+  const batchId = `batch_${batchNow}`;
+  const createdTasks = [];
 
+  for (const title of subTasks) {
     const newTask = {
       id: store.nextId++,
+      batchId,
       chatId: jid,
-      chatIdLocked: true, // Strictly lock Dashboard-assigned phone number so replies never overwrite it with @lid!
+      chatIdLocked: true,
       title: employeeName ? `@${employeeName} - ${title}` : title,
       mentions: [],
       assignee: employeeName || 'Employee',
       progress: 0,
       status: 'in_progress',
       intervalMins: mins,
-      lastNudgeAt: Date.now(),
-      nextNudgeAt: Date.now() + mins * 60000 + staggerMs,
+      lastNudgeAt: batchNow,
+      nextNudgeAt: sharedNextNudgeAt, // Exact same timestamp so reminders are always combined!
       lastNote: 'Assigned from Dashboard',
       createdAt: new Date().toISOString()
     };
     store.tasks.push(newTask);
+    createdTasks.push(newTask);
+  }
+  saveStore();
 
+  if (createdTasks.length === 1) {
+    const newTask = createdTasks[0];
     await sendWhatsAppMessage(
       jid,
       `📋 *NEW TASK ASSIGNED (#${newTask.id})*\n\n👤 *Assignee:* ${newTask.assignee}\n📌 *Task:* ${newTask.title}\n⏰ *Auto-Reminder:* ${formatIntervalLabel(mins)} (9 AM - 6 PM)\n\n💡 _अपडेट देने के लिए इस मैसेज पर Reply करें या लिखें: "#${newTask.id} 25% हो गया"_`,
       []
     );
+  } else if (createdTasks.length > 1) {
+    const listStr = createdTasks
+      .map(t => `🔹 *#${t.id}:* ${t.title} (0% पूरा हुआ)`)
+      .join('\n');
+    await sendWhatsAppMessage(
+      jid,
+      `📋 *MULTIPLE TASKS ASSIGNED (${createdTasks.length} Tasks)*\n👤 *Assignee:* ${employeeName || 'Employee'}\n\n${listStr}\n\n⏰ *Auto-Reminder:* ${formatIntervalLabel(mins)} (9 AM - 6 PM) — _सभी का रिमाइंडर एक साथ एक ही मैसेज में आएगा!_\n\n💡 _एक साथ या अलग-अलग अपडेट ऐसे दें:_\n_• "#${createdTasks[0].id} 50% #${createdTasks[1].id} 100%"_\n_• या "#${createdTasks[0].id} 25% हो गया"_`,
+      []
+    );
   }
-  saveStore();
+
   res.redirect('/');
 });
 
@@ -1199,7 +1388,7 @@ app.post('/api/complete/:id', async (req, res) => {
     saveStore();
     await sendWhatsAppMessage(
       task.chatId,
-      `✅ *TASK APPROVED & COMPLETED (#${task.id})*\n\n📌 "${task.title}" को डैशबोर्ड से Complete कर दिया गया है। अब रिमाइंडर बंद हो गए हैं।`,
+      `✅ *TASK APPROVED & COMPLETED (#${task.id})*\n\n📌 "${task.title}" को डैशबोर्ड से Complete कर दिया गया है। अब इसके रिमाइंडर बंद हो गए हैं।`,
       task.mentions,
       task.altChatId
     );
@@ -1219,7 +1408,15 @@ app.get('/', async (req, res) => {
   const istNow = getISTDate();
   const timeStr = istNow.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
   const quietNow = isQuietHours();
-  const remindedId = req.query.reminded ? parseInt(req.query.reminded, 10) : null;
+  const remindedParam = req.query.reminded || null;
+
+  // Group active tasks by chatId so we can show a "🔔 Remind All Combined" button when an employee has multiple tasks
+  const chatTaskCounts = {};
+  for (const t of activeTasks) {
+    const key = normalizeJid(t.chatId);
+    chatTaskCounts[key] = (chatTaskCounts[key] || 0) + 1;
+  }
+  const multiTaskChats = Object.keys(chatTaskCounts).filter(k => chatTaskCounts[k] > 1);
 
   let qrImageUrl = '';
   if (currentQR) {
@@ -1232,7 +1429,7 @@ app.get('/', async (req, res) => {
   <meta charset="UTF-8">
   <meta name="google" content="notranslate">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsTask Auto-Followup Bot v3.1</title>
+  <title>WhatsTask Auto-Followup Bot v3.2</title>
   <style>
     body { background:#0b1120; color:#f8fafc; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
     .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:540px; margin:0 auto 16px; }
@@ -1251,8 +1448,8 @@ app.get('/', async (req, res) => {
 </head>
 <body>
   <div class="card" style="text-align:center;">
-    <h1>WhatsTask Auto-Followup Bot v3.1 (Final)</h1>
-    <p style="color:#94a3b8; font-size:13px; margin:0;">Locked Phone JID • Zero Waiting-Message Fix • Auto 9 AM - 6 PM</p>
+    <h1>WhatsTask Auto-Followup Bot v3.2 (Final)</h1>
+    <p style="color:#94a3b8; font-size:13px; margin:0;">Combined Multi-Task Reminders • Zero Waiting-Message Fix • 9 AM - 6 PM</p>
     <div id="statusBadgeContainer">
       ${isConnected
         ? '<span class="badge badge-ok">✅ WhatsApp Connected & Active</span>'
@@ -1263,9 +1460,9 @@ app.get('/', async (req, res) => {
     </p>
   </div>
 
-  ${remindedId ? `
+  ${remindedParam ? `
   <div class="card" style="padding:0; background:transparent; border:none;">
-    <div class="toast">🔔 Task #${remindedId} का रिमाइंडर WhatsApp पर तुरंत भेज दिया गया है!</div>
+    <div class="toast">🔔 ${remindedParam === 'all' ? 'सभी पेंडिंग टास्क का एक संयुक्त (Combined) रिमाइंडर' : 'Task #' + remindedParam + ' का रिमाइंडर'} WhatsApp पर तुरंत भेज दिया गया है!</div>
   </div>
   ` : ''}
 
@@ -1332,22 +1529,20 @@ app.get('/', async (req, res) => {
   `}
 
   <div class="card" style="border-color:#14532d; background:#0c1f17;">
-    <h4 style="color:#4ade80; margin:0 0 8px;">💡 WhatsApp से टास्क और रिप्लाई कैसे काम करेगा?</h4>
-    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. नया टास्क देने के लिए शुरू में <b>Task:</b> लिखें और समय <b>[15m]</b> या <b>[2h]</b> लगाएं:</p>
-    <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">Task: @Dexterous Dessins [15m]
-1. क्लाइंट को कोटेशन भेजो
-2. साइट की फोटो मंगवाओ</pre>
+    <h4 style="color:#4ade80; margin:0 0 8px;">💡 मल्टीपल टास्क और संयुक्त (Combined) रिमाइंडर कैसे काम करेगा?</h4>
+    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. एक व्यक्ति को 10 टास्क देने पर अब 10 अलग-अलग रिमाइंडर नहीं जाएंगे—बल्कि <b>एक ही संयुक्त (Combined) मैसेज</b> में सारे पेंडिंग टास्क की लिस्ट जाएगी!</p>
+    <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">#117 50% #118 100% #123 30%</pre>
     <p style="font-size:12px; color:#94a3b8; margin:8px 0 0;">
-      2. रिमाइंडर रोज़ सुबह <b>9:00 AM से शाम 6:00 PM</b> तक अपने आप जाएंगे और शाम 6 बजे से सुबह 9 बजे तक अपने आप बंद रहेंगे।
+      2. एम्प्लॉई एक ही मैसेज में कई टास्क का अपडेट दे सकता है या किसी एक का (जैसे: <b>#123 40% हो गया</b>)।
     </p>
   </div>
 
   <div class="card">
     <h3 style="margin-top:0;">Assign New Task (One or Multiple)</h3>
     <form method="POST" action="/api/assign">
-      <input name="employeeName" placeholder="Employee Name (e.g. DD)" required />
+      <input name="employeeName" placeholder="Employee Name (e.g. Ram Sir)" required />
       <input name="phone" placeholder="WhatsApp Number with 91 (e.g. 919876543210)" required />
-      <textarea name="details" rows="3" placeholder="1. Send quotation PDF&#10;2. Check site report" required></textarea>
+      <textarea name="details" rows="4" placeholder="1. Raghu&#10;2. Park Hyatt&#10;3. Contractor payment" required></textarea>
       <select name="intervalMins">
         <option value="15">Remind every 15 Minutes (Daytime 9AM-6PM)</option>
         <option value="60">Remind every 1 Hour (Daytime 9AM-6PM)</option>
@@ -1355,12 +1550,20 @@ app.get('/', async (req, res) => {
         <option value="240">Remind every 4 Hours (Daytime 9AM-6PM)</option>
         <option value="1440">Remind every 24 Hours (Daily 9AM-6PM)</option>
       </select>
-      <button type="submit" class="btn">Send on WhatsApp & Start Reminders</button>
+      <button type="submit" class="btn">Send Combined on WhatsApp & Start Reminders</button>
     </form>
   </div>
 
   <div class="card">
     <h3 style="margin-top:0;">Active Tasks (${activeTasks.length})</h3>
+    ${multiTaskChats.map(chatKey => `
+      <form method="POST" action="/api/remind-chat" style="margin-bottom:12px;">
+        <input type="hidden" name="chatId" value="${chatKey}" />
+        <button type="submit" style="width:100%; background:#f59e0b; color:#0f172a; border:none; padding:10px 14px; border-radius:10px; font-weight:800; cursor:pointer; font-size:13px;">
+          🔔 Send 1 Combined Reminder for All ${chatTaskCounts[chatKey]} Tasks (${chatKey.split('@')[0]})
+        </button>
+      </form>
+    `).join('')}
     ${activeTasks.length === 0 ? '<p style="color:#64748b; font-size:14px;">कोई पेंडिंग टास्क नहीं है।</p>' : activeTasks.map(t => `
       <div class="task-row">
         <div style="flex:1; min-width:200px;">
@@ -1375,7 +1578,7 @@ app.get('/', async (req, res) => {
         </div>
         <div style="display:flex; gap:6px; align-items:center;">
           <form method="POST" action="/api/remind/${t.id}" style="margin:0;">
-            <button type="submit" title="Send Reminder Now on WhatsApp" style="background:#f59e0b; color:#0f172a; border:none; padding:8px 10px; border-radius:8px; font-weight:700; cursor:pointer; font-size:12px;">🔔 Remind</button>
+            <button type="submit" title="Send Single Reminder" style="background:#f59e0b; color:#0f172a; border:none; padding:8px 10px; border-radius:8px; font-weight:700; cursor:pointer; font-size:12px;">🔔 Remind</button>
           </form>
           <form method="POST" action="/api/complete/${t.id}" style="margin:0;">
             <button type="submit" style="background:#059669; color:#fff; border:none; padding:8px 10px; border-radius:8px; font-weight:600; cursor:pointer; font-size:12px;">Approve</button>
