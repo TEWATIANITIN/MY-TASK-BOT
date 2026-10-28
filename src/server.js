@@ -1,19 +1,15 @@
 /**
- * WhatsTask Auto-Followup Bot (Final v3.2 - Combined Multi-Task Reminder + Multi-Line Bulk Reply Update)
+ * WhatsTask Auto-Followup Bot (Final v3.3 - Default 24 Hours Reminder + Combined Multi-Task Reminders)
  *
- * KEY UPGRADES IN v3.2:
- * 1. COMBINED SINGLE REMINDER FOR MULTIPLE TASKS (No More 10 Separate Messages Spam!):
- *    - When you assign 10 tasks to an employee (like #117 to #126 for Ram Gopal), the bot now sends ONE combined summary message when assigning AND ONE combined reminder message when due!
- *    - Example Combined Reminder:
- *      ⏰ *COMBINED TASK REMINDER (10 Pending Tasks)*
- *      🔹 *#117:* Raghu — *0%* (Note: Assigned)
- *      🔹 *#118:* Park Hyatt — *0%* (Note: Assigned)
- *      ...
- * 2. MULTI-TASK BULK REPLY SUPPORT:
- *    - The employee can reply to multiple tasks in a single message (e.g. `#117 50% #118 done #123 30%`) and the bot will update all of them at once and send ONE combined confirmation!
- * 3. DASHBOARD ASSIGN ALSO COMBINED:
- *    - Assigning multiple tasks from the Dashboard now sends ONE clean combined message instead of 10 separate messages, and sets the same `batchId` & `nextNudgeAt` so their reminders always come together in 1 message.
- * 4. Preserves all v3.1 fixes: Locked Phone JID (`@s.whatsapp.net`), Zero "Waiting for this message" fix, Strict 9:00 AM - 6:00 PM IST schedule, and Manual "🔔 Remind" button.
+ * KEY UPGRADES IN v3.3:
+ * 1. DEFAULT REMINDER CHANGED TO 24 HOURS (1440 Minutes):
+ *    - Whenever you assign a task in WhatsApp without specifying a bracket interval (like `[15m]` or `[2h]`), the default reminder interval is now 24 Hours (1440 mins) instead of 2 Hours!
+ *    - Also made "Remind every 24 Hours (Daily 9AM-6PM)" the default selected option in the Dashboard dropdown.
+ * 2. COMBINED SINGLE REMINDER FOR MULTIPLE TASKS (No More 10 Separate Messages Spam!):
+ *    - When you assign multiple tasks to an employee, the bot sends ONE combined summary message when assigning AND ONE combined reminder message when due.
+ * 3. MULTI-TASK BULK REPLY SUPPORT:
+ *    - Employees can reply to multiple tasks in a single message (e.g. `#117 50% #118 done #123 30%`) and the bot updates all of them at once.
+ * 4. Preserves all v3.1/v3.2 fixes: Locked Phone JID (`@s.whatsapp.net`), Zero "Waiting for this message" fix, Strict 9:00 AM - 6:00 PM IST schedule, and Manual "🔔 Remind" button.
  */
 
 const express = require('express');
@@ -165,7 +161,7 @@ for (const t of store.tasks) {
     }
 
     if (!t.nextNudgeAt) {
-      t.nextNudgeAt = Date.now() + (t.intervalMins || 120) * 60000;
+      t.nextNudgeAt = Date.now() + (t.intervalMins || 1440) * 60000;
     }
 
     // Align tasks of the same chat + same interval that were created within 2 minutes of each other so they remind together!
@@ -411,7 +407,7 @@ async function triggerBatchReminder(tasksList, isManual = false) {
     const finishNow = Date.now();
     for (const t of tasksList) {
       t.lastNudgeAt = finishNow;
-      t.nextNudgeAt = finishNow + (t.intervalMins || 120) * 60000;
+      t.nextNudgeAt = finishNow + (t.intervalMins || 1440) * 60000;
       t.lastSendError = null;
     }
     saveStore();
@@ -511,7 +507,8 @@ function cleanTaskText(rawText) {
     .trim();
 }
 
-function parseIntervalMinutes(rawText, defaultMins = 120) {
+// Default interval is now 1440 minutes (24 Hours) when no interval tag is provided in WhatsApp!
+function parseIntervalMinutes(rawText, defaultMins = 1440) {
   const m = rawText.match(/\[(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\]/i);
   if (m) {
     const val = parseInt(m[1], 10);
@@ -521,12 +518,13 @@ function parseIntervalMinutes(rawText, defaultMins = 120) {
     if (unit.startsWith('d')) return val * 1440;
   }
 
-  const nat = rawText.match(/(?:every|har|हर)\s*(\d+)\s*(m|min|mins|minute|minutes|मिनट|h|hr|hrs|hour|hours|घंटे|घंटा)/i);
+  const nat = rawText.match(/(?:every|har|हर)\s*(\d+)\s*(m|min|mins|minute|minutes|मिनट|h|hr|hrs|hour|hours|घंटे|घंटा|d|day|days|दिन)/i);
   if (nat) {
     const val = parseInt(nat[1], 10);
     const unit = nat[2].toLowerCase();
     if (unit.startsWith('m') || unit.includes('मिनट')) return Math.max(5, val);
     if (unit.startsWith('h') || unit.includes('घंट')) return val * 60;
+    if (unit.startsWith('d') || unit.includes('दिन')) return val * 1440;
   }
 
   return defaultMins;
@@ -615,11 +613,7 @@ function classifyTaskUpdateSegment(segmentText, targetTaskId) {
 }
 
 /**
- * STRICT REPLY PARSER (v3.2 - Supports Single OR Multi-Task Bulk Replies!)
- * Examples supported:
- *  - "#117 50% #118 done #120 thoda delay hai" -> updates #117, #118, and #120 in ONE go!
- *  - "Approve #117 #118" or "Approve all"
- *  - Swipe-reply to a combined reminder with "50% ho gaya" or "#123 40%"
+ * STRICT REPLY PARSER (v3.3 - Supports Single OR Multi-Task Bulk Replies!)
  */
 function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) {
   const raw = (text || '').trim();
@@ -693,7 +687,6 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
   }
 
   if (!targetTaskId && quotedText) {
-    // Check if the quoted message has a single task ID or multiple task IDs
     const allQuotedIds = Array.from(quotedText.matchAll(/#(\d{3,4})\b/g))
       .map(m => parseInt(m[1], 10))
       .filter(idNum => allActiveTasks.some(t => t.id === idNum));
@@ -703,15 +696,12 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
       targetTaskId = uniqueQuotedIds[0];
       isExplicitlyTargeted = true;
     } else if (uniqueQuotedIds.length > 1) {
-      // Quoted a combined multi-task message without typing a specific #ID:
-      // If user wrote "all done" or "50% all", apply to all quoted tasks in this chat; otherwise ask or apply if only 1 active
       const textWithoutIds = lower.replace(/@\d{10,18}\b/g, '');
       const pctMatch = textWithoutIds.match(/\b(\d{1,3})\s*(?:%|percent|prcnt|प्रतिशत|फीसदी)/i);
       if (/\b(all|sab|saare|सारे|सब)\b/i.test(lower) && (pctMatch || /\b(done|ho gaya|complete)\b/i.test(lower))) {
         const updates = uniqueQuotedIds.map(idNum => classifyTaskUpdateSegment(raw, idNum));
         return { ignore: false, type: 'multi_task_update', updates };
       }
-      // If they didn't specify which #ID out of the 10 tasks in the combined message, prompt them kindly
       return {
         ignore: false,
         type: 'clarify_which_task',
@@ -730,7 +720,6 @@ function parseIncomingReply(text, quotedText, chatMatchedTasks, allActiveTasks) 
     if (chatMatchedTasks.length === 1 && pctMatch && raw.length <= 45) {
       targetTaskId = chatMatchedTasks[0].id;
     } else if (chatMatchedTasks.length > 1 && pctMatch && raw.length <= 45) {
-      // Multiple active tasks in this chat and employee sent bare "25% ho gaya" without #ID
       return {
         ignore: false,
         type: 'clarify_which_task',
@@ -929,8 +918,9 @@ async function startWhatsApp() {
           '';
 
         // A. Assign new task(s) from WhatsApp when message starts with "Task:" or "टास्क:"
+        // Default reminder interval is now 1440 mins (24 Hours)!
         if (/^(?:task|टास्क)\s*:/i.test(trimmed)) {
-          const intervalMins = parseIntervalMinutes(trimmed, 120);
+          const intervalMins = parseIntervalMinutes(trimmed, 1440);
           const subTaskStrings = extractMultipleTasks(trimmed);
           const isGroupChat = replyTargetJid.endsWith('@g.us');
 
@@ -1064,7 +1054,7 @@ async function startWhatsApp() {
           continue;
         }
 
-        // If employee replied "25% ho gaya" without #ID when 10 tasks are active in the chat
+        // If employee replied "25% ho gaya" without #ID when multiple tasks are active in the chat
         if (parsed.type === 'clarify_which_task') {
           const idExamples = parsed.candidateIds.slice(0, 3).map(id => `#${id}`).join(', ');
           await sendWhatsAppMessage(
@@ -1137,7 +1127,7 @@ async function startWhatsApp() {
           task.altChatId = rawRemoteJid;
         }
 
-        // Check if this task is part of a multi-task chat so we keep its nextNudgeAt synced with its siblings!
+        // Keep nextNudgeAt synced with sibling tasks in the same chat & interval
         const siblingTasks = allActiveTasks.filter(
           s => s.id !== task.id && normalizeJid(s.chatId) === normalizeJid(task.chatId) && s.intervalMins === task.intervalMins
         );
@@ -1317,9 +1307,8 @@ app.post('/api/reset-session', async (req, res) => {
 });
 
 /**
- * Assign New Task(s) from Dashboard (v3.2):
- * - Now sends ONE combined WhatsApp message when multiple tasks are entered, instead of spamming 10 separate messages!
- * - Gives all tasks in the batch the exact same `nextNudgeAt` so their automatic reminders also go out as ONE combined message!
+ * Assign New Task(s) from Dashboard (v3.3):
+ * - Default interval fallback is now 1440 mins (24 Hours).
  */
 app.post('/api/assign', async (req, res) => {
   const { employeeName, phone, details, intervalMins } = req.body;
@@ -1328,7 +1317,7 @@ app.post('/api/assign', async (req, res) => {
   const cleanPhone = phone.replace(/\D/g, '');
   const finalPhone = cleanPhone.length === 10 ? `91${cleanPhone}` : cleanPhone;
   const jid = finalPhone.endsWith('@g.us') ? finalPhone : `${finalPhone}@s.whatsapp.net`;
-  const mins = parseInt(intervalMins, 10) || 120;
+  const mins = parseInt(intervalMins, 10) || 1440;
 
   const subTasks = extractMultipleTasks(details);
   const batchNow = Date.now();
@@ -1429,7 +1418,7 @@ app.get('/', async (req, res) => {
   <meta charset="UTF-8">
   <meta name="google" content="notranslate">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WhatsTask Auto-Followup Bot v3.2</title>
+  <title>WhatsTask Auto-Followup Bot v3.3</title>
   <style>
     body { background:#0b1120; color:#f8fafc; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
     .card { background:#151f32; border:1px solid #263554; border-radius:16px; padding:20px; max-width:540px; margin:0 auto 16px; }
@@ -1448,8 +1437,8 @@ app.get('/', async (req, res) => {
 </head>
 <body>
   <div class="card" style="text-align:center;">
-    <h1>WhatsTask Auto-Followup Bot v3.2 (Final)</h1>
-    <p style="color:#94a3b8; font-size:13px; margin:0;">Combined Multi-Task Reminders • Zero Waiting-Message Fix • 9 AM - 6 PM</p>
+    <h1>WhatsTask Auto-Followup Bot v3.3 (Final)</h1>
+    <p style="color:#94a3b8; font-size:13px; margin:0;">Default 24h Reminder • Combined Multi-Task Reminders • 9 AM - 6 PM</p>
     <div id="statusBadgeContainer">
       ${isConnected
         ? '<span class="badge badge-ok">✅ WhatsApp Connected & Active</span>'
@@ -1530,7 +1519,7 @@ app.get('/', async (req, res) => {
 
   <div class="card" style="border-color:#14532d; background:#0c1f17;">
     <h4 style="color:#4ade80; margin:0 0 8px;">💡 मल्टीपल टास्क और संयुक्त (Combined) रिमाइंडर कैसे काम करेगा?</h4>
-    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. एक व्यक्ति को 10 टास्क देने पर अब 10 अलग-अलग रिमाइंडर नहीं जाएंगे—बल्कि <b>एक ही संयुक्त (Combined) मैसेज</b> में सारे पेंडिंग टास्क की लिस्ट जाएगी!</p>
+    <p style="font-size:13px; color:#cbd5e1; margin:0 0 8px;">1. बिना समय लिखे सीधा <b>Task:</b> लिखने पर अब डिफ़ॉल्ट रूप से <b>24 Hours (Daily)</b> का रिमाइंडर सेट होगा। अगर कम समय चाहिए तो <b>[2h]</b> या <b>[15m]</b> लिख सकते हैं।</p>
     <pre style="background:#07120d; padding:10px; border-radius:8px; color:#4ade80; font-size:12px; white-space:pre-wrap;">#117 50% #118 100% #123 30%</pre>
     <p style="font-size:12px; color:#94a3b8; margin:8px 0 0;">
       2. एम्प्लॉई एक ही मैसेज में कई टास्क का अपडेट दे सकता है या किसी एक का (जैसे: <b>#123 40% हो गया</b>)।
@@ -1546,9 +1535,9 @@ app.get('/', async (req, res) => {
       <select name="intervalMins">
         <option value="15">Remind every 15 Minutes (Daytime 9AM-6PM)</option>
         <option value="60">Remind every 1 Hour (Daytime 9AM-6PM)</option>
-        <option value="120" selected>Remind every 2 Hours (Daytime 9AM-6PM)</option>
+        <option value="120">Remind every 2 Hours (Daytime 9AM-6PM)</option>
         <option value="240">Remind every 4 Hours (Daytime 9AM-6PM)</option>
-        <option value="1440">Remind every 24 Hours (Daily 9AM-6PM)</option>
+        <option value="1440" selected>Remind every 24 Hours (Daily 9AM-6PM)</option>
       </select>
       <button type="submit" class="btn">Send Combined on WhatsApp & Start Reminders</button>
     </form>
